@@ -61,8 +61,6 @@
 		</dict>
 	</dict>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Relay Client needs microphone access for voice conversations.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Relay Client uses speech recognition for voice conversations.</string>
+	<string>Relay Client needs microphone access for voice conversations with Eve.</string>
 </dict>
 </plist>
