@@ -15,12 +15,8 @@
 		504EC30F1FED79650016851F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30E1FED79650016851F /* Assets.xcassets */; };
 		504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
 		50B271D11FEDC1A000F3C39B /* public in Resources */ = {isa = PBXBuildFile; fileRef = 50B271D01FEDC1A000F3C39B /* public */; };
-		E10001012DB07C7200EA0001 /* EveVoicePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10001002DB07C7200EA0001 /* EveVoicePlugin.swift */; };
-		E10001032DB07C7200EA0003 /* EveVoice.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10001022DB07C7200EA0003 /* EveVoice.swift */; };
 		E10001052DB07C7200EA0005 /* SSLTrustPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10001042DB07C7200EA0005 /* SSLTrustPlugin.swift */; };
 		E10001092DB07C7200EA0009 /* RelayViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10001082DB07C7200EA0008 /* RelayViewController.swift */; };
-		E20001022DB07C7200EB0003 /* KokoroCoreML in Frameworks */ = {isa = PBXBuildFile; productRef = E20001012DB07C7200EB0002 /* KokoroCoreML */; };
-		E20001042DB07C7200EB0004 /* KokoroModelFetcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = E20001032DB07C7200EB0005 /* KokoroModelFetcher.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -34,11 +30,8 @@
 		504EC3131FED79650016851F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		50B271D01FEDC1A000F3C39B /* public */ = {isa = PBXFileReference; lastKnownFileType = folder; path = public; sourceTree = "<group>"; };
 		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
-		E10001002DB07C7200EA0001 /* EveVoicePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveVoicePlugin.swift; sourceTree = "<group>"; };
-		E10001022DB07C7200EA0003 /* EveVoice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveVoice.swift; sourceTree = "<group>"; };
 		E10001042DB07C7200EA0005 /* SSLTrustPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSLTrustPlugin.swift; sourceTree = "<group>"; };
 		E10001082DB07C7200EA0008 /* RelayViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayViewController.swift; sourceTree = "<group>"; };
-		E20001032DB07C7200EB0005 /* KokoroModelFetcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KokoroModelFetcher.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -47,7 +40,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */,
-				E20001022DB07C7200EB0003 /* KokoroCoreML in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -91,20 +83,17 @@
 		E10001062DB07C7200EA0006 /* Plugins */ = {
 			isa = PBXGroup;
 			children = (
-				E10001072DB07C7200EA0007 /* EveVoice */,
+				E10001072DB07C7200EA0007 /* SSLTrust */,
 			);
 			path = Plugins;
 			sourceTree = "<group>";
 		};
-		E10001072DB07C7200EA0007 /* EveVoice */ = {
+		E10001072DB07C7200EA0007 /* SSLTrust */ = {
 			isa = PBXGroup;
 			children = (
-				E10001002DB07C7200EA0001 /* EveVoicePlugin.swift */,
-				E10001022DB07C7200EA0003 /* EveVoice.swift */,
 				E10001042DB07C7200EA0005 /* SSLTrustPlugin.swift */,
-				E20001032DB07C7200EB0005 /* KokoroModelFetcher.swift */,
 			);
-			path = EveVoice;
+			path = SSLTrust;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -125,7 +114,6 @@
 			name = App;
 			packageProductDependencies = (
 				4D22ABE82AF431CB00220026 /* CapApp-SPM */,
-				E20001012DB07C7200EB0002 /* KokoroCoreML */,
 			);
 			productName = App;
 			productReference = 504EC3041FED79650016851F /* App.app */;
@@ -158,7 +146,6 @@
 			mainGroup = 504EC2FB1FED79650016851F;
 			packageReferences = (
 				D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */,
-				E20001002DB07C7200EB0001 /* XCRemoteSwiftPackageReference "kokoro-coreml" */,
 			);
 			productRefGroup = 504EC3051FED79650016851F /* Products */;
 			projectDirPath = "";
@@ -191,11 +178,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
-				E10001012DB07C7200EA0001 /* EveVoicePlugin.swift in Sources */,
-				E10001032DB07C7200EA0003 /* EveVoice.swift in Sources */,
 				E10001052DB07C7200EA0005 /* SSLTrustPlugin.swift in Sources */,
 				E10001092DB07C7200EA0009 /* RelayViewController.swift in Sources */,
-				E20001042DB07C7200EB0004 /* KokoroModelFetcher.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -406,27 +390,11 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		E20001002DB07C7200EB0001 /* XCRemoteSwiftPackageReference "kokoro-coreml" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/Jud/kokoro-coreml.git";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.8.0;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
 /* Begin XCSwiftPackageProductDependency section */
 		4D22ABE82AF431CB00220026 /* CapApp-SPM */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */;
 			productName = "CapApp-SPM";
-		};
-		E20001012DB07C7200EB0002 /* KokoroCoreML */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = E20001002DB07C7200EB0001 /* XCRemoteSwiftPackageReference "kokoro-coreml" */;
-			productName = KokoroCoreML;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -2,7 +2,6 @@ import Foundation
 import Capacitor
 
 /// Handles SSL certificate trust for the eve.lan self-signed certificate.
-/// Separate from EveVoice to keep concerns clean.
 @objc(SSLTrustPlugin)
 public class SSLTrustPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "SSLTrustPlugin"
