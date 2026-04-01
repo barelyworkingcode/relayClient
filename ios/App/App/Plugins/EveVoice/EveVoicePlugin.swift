@@ -17,9 +17,10 @@ public class EveVoicePlugin: CAPPlugin, CAPBridgedPlugin {
     private let implementation = EveVoice()
 
     override public func load() {
-        print("[EveVoice] Plugin loaded")
         implementation.onEvent = { [weak self] name, data in
-            self?.notifyListeners(name, data: data)
+            DispatchQueue.main.async {
+                self?.notifyListeners(name, data: data)
+            }
         }
     }
 
