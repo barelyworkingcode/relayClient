@@ -1,9 +1,10 @@
 import Foundation
 import AVFoundation
 import Speech
+import KokoroCoreML
 
-/// Native voice implementation using Apple frameworks.
-/// TTS: AVSpeechSynthesizer (built-in, no model download)
+/// Native voice implementation.
+/// TTS: Kokoro CoreML (high-quality neural TTS), AVSpeechSynthesizer fallback
 /// STT: SFSpeechRecognizer (on-device when available)
 class EveVoice: NSObject {
     var onEvent: ((String, [String: Any]) -> Void)?
@@ -13,7 +14,12 @@ class EveVoice: NSObject {
     private var modelsLoaded = false
     private var shouldResumeListening = false
 
-    // TTS
+    // TTS - Kokoro
+    private var kokoroEngine: KokoroEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var playbackEngine: AVAudioEngine?
+
+    // TTS - fallback
     private let synthesizer = AVSpeechSynthesizer()
     private var speakContinuation: CheckedContinuation<Void, Never>?
     private var speakContinuationResumed = false
@@ -36,53 +42,56 @@ class EveVoice: NSObject {
     func loadModels() async throws {
         if modelsLoaded { return }
 
-        let authStatus = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
+        // Request speech recognition auth (deferred — don't block TTS model loading)
+        Task {
+            await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { s in
+                    continuation.resume(returning: s)
+                }
             }
         }
-        guard authStatus == .authorized else {
-            throw EveVoiceError.speechRecognitionDenied
+
+        // Download Kokoro models on first use (~99MB), then init engine
+        let modelDir = KokoroEngine.defaultModelDirectory
+        do {
+            if !KokoroEngine.isDownloaded(at: modelDir) {
+                onEvent?("modelProgress", ["model": "tts", "progress": 0])
+                try await KokoroModelFetcher.download(to: modelDir) { progress in
+                    self.onEvent?("modelProgress", ["model": "tts", "progress": progress])
+                }
+            }
+            kokoroEngine = try KokoroEngine(modelDirectory: modelDir)
+            onEvent?("modelLoaded", ["model": "tts", "status": "ready"])
+        } catch {
+            onEvent?("modelLoaded", ["model": "tts", "status": "fallback"])
         }
 
         modelsLoaded = true
         onEvent?("modelLoaded", ["model": "stt", "status": "ready"])
-        onEvent?("modelLoaded", ["model": "tts", "status": "ready"])
     }
 
-    // MARK: - TTS via AVSpeechSynthesizer
+    // MARK: - TTS
 
     func speak(text: String, voice: String) async throws {
         if !modelsLoaded {
             try await loadModels()
         }
 
-        // Pause STT if active so TTS can use the audio hardware
+        // Pause STT if active
         let wasListening = isListening
         if wasListening {
-            shouldResumeListening = false  // Prevent auto-restart from error handler
+            shouldResumeListening = false
             isListening = false
             stopListeningInternal()
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
 
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-        utterance.pitchMultiplier = 1.0
-        utterance.volume = 1.0
-
-        if let selectedVoice = AVSpeechSynthesisVoice(language: "en-US") {
-            utterance.voice = selectedVoice
-        }
-
         try configureAudioSession()
 
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            self.speakContinuation = continuation
-            self.speakContinuationResumed = false
-            self.isSpeaking = true
-            self.onEvent?("ttsStarted", [:])
-            self.synthesizer.speak(utterance)
+        if let engine = kokoroEngine {
+            try await speakWithKokoro(engine, text: text, voice: voice)
+        } else {
+            try await speakWithAVSpeech(text: text)
         }
 
         // Resume STT after speaking
@@ -94,7 +103,74 @@ class EveVoice: NSObject {
         }
     }
 
+    private func speakWithKokoro(_ engine: KokoroEngine, text: String, voice: String) async throws {
+        isSpeaking = true
+        onEvent?("ttsStarted", [:])
+
+        do {
+            let format = KokoroEngine.audioFormat
+            let pEngine = AVAudioEngine()
+            let pNode = AVAudioPlayerNode()
+            pEngine.attach(pNode)
+            pEngine.connect(pNode, to: pEngine.mainMixerNode, format: format)
+            try pEngine.start()
+            pNode.play()
+            playbackEngine = pEngine
+            playerNode = pNode
+
+            var hasAudio = false
+            for await event in try engine.speak(text, voice: voice) {
+                switch event {
+                case .audio(let buffer):
+                    hasAudio = true
+                    await pNode.scheduleBuffer(buffer)
+                case .chunkFailed:
+                    break
+                }
+            }
+
+            if !hasAudio {
+                throw EveVoiceError.ttsNoAudio
+            }
+
+            pNode.stop()
+            pEngine.stop()
+            playbackEngine = nil
+            playerNode = nil
+        } catch {
+            playbackEngine?.stop()
+            playbackEngine = nil
+            playerNode = nil
+            try await speakWithAVSpeech(text: text)
+            return
+        }
+
+        isSpeaking = false
+        onEvent?("ttsFinished", [:])
+    }
+
+    private func speakWithAVSpeech(text: String) async throws {
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        utterance.volume = 1.0
+        if let voice = AVSpeechSynthesisVoice(language: "en-US") {
+            utterance.voice = voice
+        }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.speakContinuation = continuation
+            self.speakContinuationResumed = false
+            self.isSpeaking = true
+            self.onEvent?("ttsStarted", [:])
+            self.synthesizer.speak(utterance)
+        }
+    }
+
     func stopSpeaking() {
+        playerNode?.stop()
+        playbackEngine?.stop()
+        playbackEngine = nil
+        playerNode = nil
         synthesizer.stopSpeaking(at: .immediate)
         isSpeaking = false
         onEvent?("ttsFinished", [:])
@@ -119,7 +195,6 @@ class EveVoice: NSObject {
             throw EveVoiceError.speechRecognizerUnavailable
         }
 
-        // Stop any existing session and ensure tap is fully removed
         stopListeningInternal()
 
         try configureAudioSession()
@@ -134,25 +209,18 @@ class EveVoice: NSObject {
         }
 
         let inputNode = audioEngine.inputNode
-
-        // Remove any lingering tap before installing a new one
         inputNode.removeTap(onBus: 0)
-
         let recordingFormat = inputNode.outputFormat(forBus: 0)
 
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
             self?.recognitionRequest?.append(buffer)
 
-            // Calculate audio level for orb visualization
             guard let channelData = buffer.floatChannelData?[0] else { return }
             let frames = Int(buffer.frameLength)
             var sum: Float = 0
-            for i in 0..<frames {
-                sum += channelData[i] * channelData[i]
-            }
+            for i in 0..<frames { sum += channelData[i] * channelData[i] }
             let rms = sqrt(sum / Float(frames))
-            let level = min(Double(rms * 5), 1.0)
-            self?.onEvent?("audioLevel", ["level": level])
+            self?.onEvent?("audioLevel", ["level": min(Double(rms * 5), 1.0)])
         }
 
         audioEngine.prepare()
@@ -169,14 +237,11 @@ class EveVoice: NSObject {
             if let result = result {
                 let text = result.bestTranscription.formattedString
                 self.lastTranscription = text
-                let isFinal = result.isFinal
-
-                self.onEvent?("transcription", ["text": text, "isFinal": isFinal])
+                self.onEvent?("transcription", ["text": text, "isFinal": result.isFinal])
                 self.resetSilenceTimer()
 
-                if isFinal {
+                if result.isFinal {
                     self.stopListeningInternal()
-                    // Auto-restart for continuous conversation
                     if self.shouldResumeListening {
                         Task {
                             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -193,7 +258,6 @@ class EveVoice: NSObject {
                 let isRoutine = (nsError.domain == "kAFAssistantErrorDomain" && ignoredCodes.contains(nsError.code)) || isCancellation
 
                 if isRoutine {
-                    // Auto-restart after transient errors (not cancellations)
                     if self.shouldResumeListening && !isCancellation {
                         Task {
                             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -221,7 +285,6 @@ class EveVoice: NSObject {
         recognitionTask = nil
         recognitionRequest?.endAudio()
         recognitionRequest = nil
-
         if audioEngine.isRunning {
             audioEngine.stop()
             audioEngine.inputNode.removeTap(onBus: 0)
@@ -236,9 +299,7 @@ class EveVoice: NSObject {
                 self.onEvent?("transcription", ["text": self.lastTranscription, "isFinal": true])
                 self.stopListeningInternal()
                 if self.shouldResumeListening {
-                    Task {
-                        try? await self.startListening()
-                    }
+                    Task { try? await self.startListening() }
                 }
             }
         }
@@ -259,11 +320,12 @@ class EveVoice: NSObject {
             "modelsLoaded": modelsLoaded,
             "isListening": isListening,
             "isSpeaking": isSpeaking,
+            "kokoroReady": kokoroEngine != nil,
         ]
     }
 }
 
-// MARK: - AVSpeechSynthesizerDelegate
+// MARK: - AVSpeechSynthesizerDelegate (fallback TTS)
 
 extension EveVoice: AVSpeechSynthesizerDelegate {
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
@@ -279,21 +341,18 @@ extension EveVoice: AVSpeechSynthesizerDelegate {
     }
 }
 
-// MARK: - Errors
-
 enum EveVoiceError: LocalizedError {
     case modelsNotLoaded
     case speechRecognitionDenied
     case speechRecognizerUnavailable
+    case ttsNoAudio
 
     var errorDescription: String? {
         switch self {
-        case .modelsNotLoaded:
-            return "Models not loaded. Call loadModels() first."
-        case .speechRecognitionDenied:
-            return "Speech recognition permission denied."
-        case .speechRecognizerUnavailable:
-            return "Speech recognizer is not available."
+        case .modelsNotLoaded: return "Models not loaded. Call loadModels() first."
+        case .speechRecognitionDenied: return "Speech recognition permission denied."
+        case .speechRecognizerUnavailable: return "Speech recognizer is not available."
+        case .ttsNoAudio: return "TTS produced no audio."
         }
     }
 }
