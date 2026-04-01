@@ -7,19 +7,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Test TTS on launch
-        let voice = EveVoice()
-        Task {
-            do {
-                NSLog("[AppDelegate] Loading models...")
-                try await voice.loadModels()
-                NSLog("[AppDelegate] Models loaded, speaking hello...")
-                try await voice.speak(text: "Hello, this is a test.", voice: "af_heart")
-                NSLog("[AppDelegate] Speak finished successfully")
-            } catch {
-                NSLog("[AppDelegate] TTS test failed: %@", error.localizedDescription)
-            }
-        }
         return true
     }
 
