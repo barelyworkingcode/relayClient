@@ -1,0 +1,20 @@
+{
+  "name": "relay-client",
+  "version": "1.0.0",
+  "description": "Capacitor iOS shell for Eve Workspace",
+  "private": true,
+  "scripts": {
+    "build": "npx cap sync ios",
+    "open": "npx cap open ios"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@capacitor/core": "^8.2.0",
+    "@capacitor/ios": "^8.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.2.0"
+  }
+}

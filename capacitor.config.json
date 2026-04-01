@@ -1,0 +1,13 @@
+{
+  "appId": "com.barelyworkingcode.relayclient",
+  "appName": "Relay Client",
+  "webDir": "www",
+  "server": {
+    "url": "https://eve.lan",
+    "cleartext": false,
+    "allowNavigation": ["eve.lan"]
+  },
+  "ios": {
+    "preferredContentMode": "mobile"
+  }
+}
