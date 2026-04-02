@@ -19,6 +19,7 @@
 		E10001092DB07C7200EA0009 /* RelayViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10001082DB07C7200EA0008 /* RelayViewController.swift */; };
 		E20001022DC07C7200EB0003 /* EveVoice.swift in Sources */ = {isa = PBXBuildFile; fileRef = E20001002DC07C7200EB0001 /* EveVoice.swift */; };
 		E20001032DC07C7200EB0004 /* EveVoicePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E20001012DC07C7200EB0002 /* EveVoicePlugin.swift */; };
+		E30001042DD07C7200EC0005 /* EveListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = E30001032DD07C7200EC0004 /* EveListener.swift */; };
 		E20001072DC07C7200EB0008 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = E20001062DC07C7200EB0007 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
@@ -37,6 +38,7 @@
 		E10001082DB07C7200EA0008 /* RelayViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayViewController.swift; sourceTree = "<group>"; };
 		E20001002DC07C7200EB0001 /* EveVoice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveVoice.swift; sourceTree = "<group>"; };
 		E20001012DC07C7200EB0002 /* EveVoicePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveVoicePlugin.swift; sourceTree = "<group>"; };
+		E30001032DD07C7200EC0004 /* EveListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveListener.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -99,6 +101,7 @@
 			isa = PBXGroup;
 			children = (
 				E20001002DC07C7200EB0001 /* EveVoice.swift */,
+				E30001032DD07C7200EC0004 /* EveListener.swift */,
 				E20001012DC07C7200EB0002 /* EveVoicePlugin.swift */,
 			);
 			path = EveVoice;
@@ -197,6 +200,7 @@
 			files = (
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
 				E20001022DC07C7200EB0003 /* EveVoice.swift in Sources */,
+				E30001042DD07C7200EC0005 /* EveListener.swift in Sources */,
 				E20001032DC07C7200EB0004 /* EveVoicePlugin.swift in Sources */,
 				E10001052DB07C7200EA0005 /* SSLTrustPlugin.swift in Sources */,
 				E10001092DB07C7200EA0009 /* RelayViewController.swift in Sources */,

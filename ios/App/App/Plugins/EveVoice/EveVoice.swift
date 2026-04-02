@@ -1,19 +1,17 @@
 import Foundation
-import AVFoundation
 import FluidAudio
 
 /// Native TTS engine wrapping FluidAudio's KokoroTtsManager.
-/// Handles model downloading, synthesis, and audio playback on-device.
+/// Handles model downloading and synthesis on-device.
+/// Audio is returned as base64 WAV data — JS handles playback.
 class EveVoice: NSObject {
     var onEvent: ((String, [String: Any]) -> Void)?
 
     private var modelsLoaded = false
-    private var sessionConfigured = false
     private var loadingTask: Task<Void, Error>?
     private let loadLock = NSLock()
 
     private var ttsManager: KokoroTtsManager?
-    private var audioPlayer: AVAudioPlayer?
 
     // MARK: - Model Management
 
@@ -36,15 +34,10 @@ class EveVoice: NSObject {
             let startTime = CFAbsoluteTimeGetCurrent()
             onEvent?("modelProgress", ["model": "tts", "progress": 0])
 
-            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            let modelDir = appSupport.appendingPathComponent("fluidaudio/Models/kokoro")
-            print("[EveVoice] Loading models (5s variant) from \(modelDir.path)")
+            print("[EveVoice] Loading models (5s variant) using default cache directory")
 
-            let manager = KokoroTtsManager(defaultVoice: "af_heart", directory: modelDir)
-            let models = try await TtsModels.download(
-                variants: [.fiveSecond],
-                directory: modelDir
-            )
+            let manager = KokoroTtsManager(defaultVoice: "af_heart")
+            let models = try await TtsModels.download(variants: [.fiveSecond])
             try await manager.initialize(models: models)
 
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
@@ -74,7 +67,9 @@ class EveVoice: NSObject {
 
     // MARK: - TTS
 
-    func speak(text: String, voice: String) async throws {
+    /// Synthesize text to WAV audio and return the data + duration.
+    /// JS handles playback via AudioContext — no native AVAudioPlayer needed.
+    func speak(text: String, voice: String) async throws -> (base64: String, duration: Double) {
         print("[EveVoice] speak() — \(text.count) chars, voice: \(voice)")
 
         if !modelsLoaded { try await loadModels() }
@@ -83,50 +78,22 @@ class EveVoice: NSObject {
             throw EveVoiceError.modelsNotLoaded
         }
 
-        // Stop any in-progress playback before starting new synthesis
-        if audioPlayer?.isPlaying == true {
-            audioPlayer?.stop()
-            audioPlayer = nil
-        }
-
-        if !sessionConfigured {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default)
-            try session.setActive(true)
-            sessionConfigured = true
-            print("[EveVoice] Audio session configured")
-        }
-
-        onEvent?("ttsStarted", [:])
         let synthStart = CFAbsoluteTimeGetCurrent()
 
-        do {
-            let wavData = try await manager.synthesize(
-                text: text,
-                voice: voice,
-                voiceSpeed: 1.0,
-                variantPreference: .fiveSecond
-            )
+        let wavData = try await manager.synthesize(
+            text: text,
+            voice: voice,
+            voiceSpeed: 1.0,
+            variantPreference: .fiveSecond
+        )
 
-            let elapsed = CFAbsoluteTimeGetCurrent() - synthStart
-            let duration = Double(wavData.count - 44) / (24000.0 * 2.0)
-            print("[EveVoice] Synthesized in \(String(format: "%.2f", elapsed))s — \(String(format: "%.1f", duration))s audio")
+        let elapsed = CFAbsoluteTimeGetCurrent() - synthStart
+        // WAV: 44-byte header, 24kHz, 16-bit mono
+        let duration = Double(wavData.count - 44) / (24000.0 * 2.0)
+        print("[EveVoice] Synthesized in \(String(format: "%.2f", elapsed))s — \(String(format: "%.1f", duration))s audio")
 
-            let player = try AVAudioPlayer(data: wavData)
-            player.delegate = self
-            audioPlayer = player
-            player.play()
-        } catch {
-            onEvent?("ttsFinished", [:])
-            print("[EveVoice] Synthesis FAILED: \(error.localizedDescription)")
-            throw error
-        }
-    }
-
-    func stopSpeaking() {
-        audioPlayer?.stop()
-        audioPlayer = nil
-        onEvent?("ttsFinished", [:])
+        let base64 = wavData.base64EncodedString()
+        return (base64: base64, duration: duration)
     }
 
     // MARK: - Voice Management
@@ -168,25 +135,8 @@ class EveVoice: NSObject {
     func getStatus() -> [String: Any] {
         [
             "modelsLoaded": modelsLoaded,
-            "isSpeaking": audioPlayer?.isPlaying ?? false,
             "kokoroReady": ttsManager != nil,
         ]
-    }
-}
-
-// MARK: - AVAudioPlayerDelegate
-
-extension EveVoice: AVAudioPlayerDelegate {
-    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        print("[EveVoice] Playback finished (success: \(flag))")
-        audioPlayer = nil
-        onEvent?("ttsFinished", [:])
-    }
-
-    func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-        print("[EveVoice] Playback error: \(error?.localizedDescription ?? "unknown")")
-        audioPlayer = nil
-        onEvent?("ttsFinished", [:])
     }
 }
 
