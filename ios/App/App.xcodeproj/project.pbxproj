@@ -17,6 +17,10 @@
 		50B271D11FEDC1A000F3C39B /* public in Resources */ = {isa = PBXBuildFile; fileRef = 50B271D01FEDC1A000F3C39B /* public */; };
 		E10001052DB07C7200EA0005 /* SSLTrustPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10001042DB07C7200EA0005 /* SSLTrustPlugin.swift */; };
 		E10001092DB07C7200EA0009 /* RelayViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = E10001082DB07C7200EA0008 /* RelayViewController.swift */; };
+		E20001022DC07C7200EB0003 /* EveVoice.swift in Sources */ = {isa = PBXBuildFile; fileRef = E20001002DC07C7200EB0001 /* EveVoice.swift */; };
+		E20001032DC07C7200EB0004 /* EveVoicePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E20001012DC07C7200EB0002 /* EveVoicePlugin.swift */; };
+		E30001042DD07C7200EC0005 /* EveListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = E30001032DD07C7200EC0004 /* EveListener.swift */; };
+		E20001072DC07C7200EB0008 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = E20001062DC07C7200EB0007 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +36,9 @@
 		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
 		E10001042DB07C7200EA0005 /* SSLTrustPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SSLTrustPlugin.swift; sourceTree = "<group>"; };
 		E10001082DB07C7200EA0008 /* RelayViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayViewController.swift; sourceTree = "<group>"; };
+		E20001002DC07C7200EB0001 /* EveVoice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveVoice.swift; sourceTree = "<group>"; };
+		E20001012DC07C7200EB0002 /* EveVoicePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveVoicePlugin.swift; sourceTree = "<group>"; };
+		E30001032DD07C7200EC0004 /* EveListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveListener.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -40,6 +47,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */,
+				E20001072DC07C7200EB0008 /* FluidAudio in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -83,9 +91,20 @@
 		E10001062DB07C7200EA0006 /* Plugins */ = {
 			isa = PBXGroup;
 			children = (
+				E20001042DC07C7200EB0005 /* EveVoice */,
 				E10001072DB07C7200EA0007 /* SSLTrust */,
 			);
 			path = Plugins;
+			sourceTree = "<group>";
+		};
+		E20001042DC07C7200EB0005 /* EveVoice */ = {
+			isa = PBXGroup;
+			children = (
+				E20001002DC07C7200EB0001 /* EveVoice.swift */,
+				E30001032DD07C7200EC0004 /* EveListener.swift */,
+				E20001012DC07C7200EB0002 /* EveVoicePlugin.swift */,
+			);
+			path = EveVoice;
 			sourceTree = "<group>";
 		};
 		E10001072DB07C7200EA0007 /* SSLTrust */ = {
@@ -114,6 +133,7 @@
 			name = App;
 			packageProductDependencies = (
 				4D22ABE82AF431CB00220026 /* CapApp-SPM */,
+				E20001062DC07C7200EB0007 /* FluidAudio */,
 			);
 			productName = App;
 			productReference = 504EC3041FED79650016851F /* App.app */;
@@ -146,6 +166,7 @@
 			mainGroup = 504EC2FB1FED79650016851F;
 			packageReferences = (
 				D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */,
+				E20001052DC07C7200EB0006 /* XCRemoteSwiftPackageReference "FluidAudio" */,
 			);
 			productRefGroup = 504EC3051FED79650016851F /* Products */;
 			projectDirPath = "";
@@ -178,6 +199,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
+				E20001022DC07C7200EB0003 /* EveVoice.swift in Sources */,
+				E30001042DD07C7200EC0005 /* EveListener.swift in Sources */,
+				E20001032DC07C7200EB0004 /* EveVoicePlugin.swift in Sources */,
 				E10001052DB07C7200EA0005 /* SSLTrustPlugin.swift in Sources */,
 				E10001092DB07C7200EA0009 /* RelayViewController.swift in Sources */,
 			);
@@ -390,11 +414,27 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		E20001052DC07C7200EB0006 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/FluidInference/FluidAudio.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.12.4;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		4D22ABE82AF431CB00220026 /* CapApp-SPM */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */;
 			productName = "CapApp-SPM";
+		};
+		E20001062DC07C7200EB0007 /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E20001052DC07C7200EB0006 /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
