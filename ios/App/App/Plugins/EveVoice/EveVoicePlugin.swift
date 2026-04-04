@@ -19,23 +19,11 @@ public class EveVoicePlugin: CAPPlugin, CAPBridgedPlugin {
     private let implementation = EveVoice()
     private let listener = EveListener()
 
-    // Track model readiness for toast management
-    private var ttsReady = false
-    private var sttReady = false
-
     override public func load() {
         print("[EveVoice] Plugin registered")
 
         implementation.onEvent = { [weak self] name, data in
             guard let self = self else { return }
-
-            if name == "modelLoaded", let model = data["model"] as? String, model == "tts" {
-                if let status = data["status"] as? String, status == "ready" {
-                    self.ttsReady = true
-                    self.updateLoadingToast()
-                }
-            }
-
             DispatchQueue.main.async {
                 self.notifyListeners(name, data: data)
             }
@@ -43,88 +31,21 @@ public class EveVoicePlugin: CAPPlugin, CAPBridgedPlugin {
 
         listener.onEvent = { [weak self] name, data in
             guard let self = self else { return }
-
-            if name == "modelLoaded", let model = data["model"] as? String, model == "asr" {
-                if let status = data["status"] as? String, status == "ready" {
-                    self.sttReady = true
-                    self.updateLoadingToast()
-                }
-            }
-
             DispatchQueue.main.async {
                 self.notifyListeners(name, data: data)
             }
         }
     }
 
-    // MARK: - Loading Toast
-
-    private func showToast(_ message: String) {
-        DispatchQueue.main.async { [weak self] in
-            let escaped = message.replacingOccurrences(of: "'", with: "\\'")
-            self?.bridge?.webView?.evaluateJavaScript("""
-                (function() {
-                    var t = document.getElementById('eve-loading-toast');
-                    if (!t) {
-                        t = document.createElement('div');
-                        t.id = 'eve-loading-toast';
-                        t.style.cssText = 'position:fixed;bottom:70px;left:50%;transform:translateX(-50%);background:rgba(30,30,30,0.92);color:#aaa;padding:8px 18px;border-radius:16px;font-size:13px;z-index:99999;pointer-events:none;font-family:-apple-system,system-ui,sans-serif;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:opacity 0.3s;white-space:nowrap;';
-                        document.body.appendChild(t);
-                    }
-                    t.textContent = '\(escaped)';
-                    t.style.opacity = '1';
-                })();
-            """, completionHandler: nil)
-        }
-    }
-
-    private func hideToast() {
-        DispatchQueue.main.async { [weak self] in
-            self?.bridge?.webView?.evaluateJavaScript("""
-                (function() {
-                    var t = document.getElementById('eve-loading-toast');
-                    if (t) { t.style.opacity = '0'; setTimeout(function(){ t.remove(); }, 300); }
-                })();
-            """, completionHandler: nil)
-        }
-    }
-
-    private func updateLoadingToast() {
-        if ttsReady && sttReady {
-            hideToast()
-        } else if ttsReady && !sttReady {
-            showToast("Preparing speech recognition\u{2026}")
-        } else if !ttsReady && sttReady {
-            showToast("Preparing voice synthesis\u{2026}")
-        } else {
-            showToast("Downloading voice models\u{2026}")
-        }
-    }
-
     // MARK: - TTS
 
     @objc func loadModels(_ call: CAPPluginCall) {
-        call.resolve()
-
-        if !ttsReady || !sttReady {
-            showToast("Downloading voice models\u{2026}")
-        }
-
         Task {
             do {
                 try await implementation.loadModels()
+                call.resolve()
             } catch {
-                print("[EveVoice] Background loadModels() failed: \(error.localizedDescription)")
-            }
-        }
-
-        if !sttReady {
-            Task {
-                do {
-                    try await listener.loadModels()
-                } catch {
-                    print("[EveVoice] Background STT loadModels() failed: \(error.localizedDescription)")
-                }
+                call.reject("TTS model loading failed: \(error.localizedDescription)")
             }
         }
     }
@@ -186,17 +107,12 @@ public class EveVoicePlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - STT
 
     @objc func loadSTTModels(_ call: CAPPluginCall) {
-        call.resolve()
-
-        if !sttReady {
-            showToast("Downloading speech recognition models\u{2026}")
-        }
-
         Task {
             do {
                 try await listener.loadModels()
+                call.resolve()
             } catch {
-                print("[EveVoice] Background loadSTTModels() failed: \(error.localizedDescription)")
+                call.reject("STT model loading failed: \(error.localizedDescription)")
             }
         }
     }
