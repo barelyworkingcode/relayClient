@@ -1,5 +1,5 @@
 {
-  "originHash" : "77742026164ed621b066b242ed37f0028f1bceb0780e5fd7d408eab8bc55f7fb",
+  "originHash" : "4a24931334f34fd964df93550e1f1950d5cc9c4576ca6beafd26bc08f41f9d71",
   "pins" : [
     {
       "identity" : "capacitor-swift-pm",
@@ -8,6 +8,15 @@
       "state" : {
         "revision" : "0e862e6ff13852a710c8a484180ca4d6a2cc9761",
         "version" : "8.2.0"
+      }
+    },
+    {
+      "identity" : "fluidaudio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/FluidInference/FluidAudio.git",
+      "state" : {
+        "revision" : "d9eef864d29783fc22754b12090631da5388c3a9",
+        "version" : "0.13.4"
       }
     }
   ],
