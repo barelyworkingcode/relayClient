@@ -62,5 +62,16 @@
 	</dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Relay Client needs microphone access for voice conversations with Eve.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.barelyworkingcode.relayclient</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>relayclient</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
