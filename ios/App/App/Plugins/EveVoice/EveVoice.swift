@@ -87,12 +87,10 @@ class EveVoice: NSObject {
             variantPreference: .fiveSecond
         )
 
-        let elapsed = CFAbsoluteTimeGetCurrent() - synthStart
         // WAV: 44-byte header, 24kHz, 16-bit mono
         let duration = Double(wavData.count - 44) / (24000.0 * 2.0)
-        print("[EveVoice] Synthesized in \(String(format: "%.2f", elapsed))s — \(String(format: "%.1f", duration))s audio")
-
         let base64 = wavData.base64EncodedString()
+        print("[EveVoice] Sending \(base64.count) bytes audio to JS (\(String(format: "%.1f", duration))s)")
         return (base64: base64, duration: duration)
     }
 
