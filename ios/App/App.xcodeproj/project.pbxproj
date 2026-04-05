@@ -21,6 +21,7 @@
 		E20001032DC07C7200EB0004 /* EveVoicePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E20001012DC07C7200EB0002 /* EveVoicePlugin.swift */; };
 		E30001042DD07C7200EC0005 /* EveListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = E30001032DD07C7200EC0004 /* EveListener.swift */; };
 		E20001072DC07C7200EB0008 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = E20001062DC07C7200EB0007 /* FluidAudio */; };
+		E40001012DE07C7200ED0002 /* VoiceChatIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = E40001002DE07C7200ED0001 /* VoiceChatIntent.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -39,6 +40,7 @@
 		E20001002DC07C7200EB0001 /* EveVoice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveVoice.swift; sourceTree = "<group>"; };
 		E20001012DC07C7200EB0002 /* EveVoicePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveVoicePlugin.swift; sourceTree = "<group>"; };
 		E30001032DD07C7200EC0004 /* EveListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveListener.swift; sourceTree = "<group>"; };
+		E40001002DE07C7200ED0001 /* VoiceChatIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceChatIntent.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -77,6 +79,7 @@
 				50379B222058CBB4000EE86E /* capacitor.config.json */,
 				504EC3071FED79650016851F /* AppDelegate.swift */,
 				E10001082DB07C7200EA0008 /* RelayViewController.swift */,
+				E40001002DE07C7200ED0001 /* VoiceChatIntent.swift */,
 				504EC30B1FED79650016851F /* Main.storyboard */,
 				504EC30E1FED79650016851F /* Assets.xcassets */,
 				504EC3101FED79650016851F /* LaunchScreen.storyboard */,
@@ -204,6 +207,7 @@
 				E20001032DC07C7200EB0004 /* EveVoicePlugin.swift in Sources */,
 				E10001052DB07C7200EA0005 /* SSLTrustPlugin.swift in Sources */,
 				E10001092DB07C7200EA0009 /* RelayViewController.swift in Sources */,
+				E40001012DE07C7200ED0002 /* VoiceChatIntent.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
