@@ -1,16 +1,23 @@
 import UIKit
 import Capacitor
 import WebKit
+import AuthenticationServices
 import os.log
 
 private let deepLinkLog = OSLog(subsystem: "com.barelyworkingcode.relayclient", category: "DeepLink")
 
-class RelayViewController: CAPBridgeViewController {
+class RelayViewController: CAPBridgeViewController, ASWebAuthenticationPresentationContextProviding {
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        return view.window ?? ASPresentationAnchor()
+    }
+
     private var loadObserver: NSKeyValueObservation?
 
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(SSLTrustPlugin())
         bridge?.registerPluginInstance(EveVoicePlugin())
+        bridge?.registerPluginInstance(SafariAuthPlugin())
 
         // Watch for initial page load to consume any pending deep link
         loadObserver = webView?.observe(\.isLoading, options: [.new]) { [weak self] _, change in
