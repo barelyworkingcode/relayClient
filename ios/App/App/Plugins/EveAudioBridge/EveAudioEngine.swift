@@ -1,0 +1,688 @@
+import AVFoundation
+import Foundation
+import os.log
+
+private let audioLog = OSLog(subsystem: "com.barelyworkingcode.relayclient", category: "AudioBridge")
+
+/// Native audio I/O loop for voice chat. Owns the mic (capture + endpointing)
+/// and the speaker (TTS playback) so a conversation keeps running with the
+/// screen off: an actively-running `AVAudioEngine` under `UIBackgroundModes:
+/// audio` holds the background assertion, which keeps the whole app — the
+/// WKWebView's JS event loop and its WebSocket — alive while the device is
+/// locked.
+///
+/// It runs NO ML model. Transcription and synthesis stay on the eve server.
+/// Native only does hardware audio + an energy-based VAD endpointer: it emits
+/// captured utterances to JS as 16 kHz mono WAV (the exact shape the server's
+/// `transcribe_audio` expects) and plays back the WAV chunks the server streams.
+///
+/// Half-duplex by design — the mic is ignored while audio is playing, so the
+/// clean `.spokenAudio` playback path keeps full Kokoro fidelity (no system
+/// voice-processing / echo canceller needed).
+final class EveAudioEngine: NSObject {
+    enum Mode: String { case handsfree, ptt }
+
+    /// Raw event sink. The plugin wraps this to marshal onto the main thread
+    /// before calling `notifyListeners`, so this may be invoked from any thread.
+    var onEvent: ((String, [String: Any]) -> Void)?
+
+    // MARK: Audio graph
+    private let engine = AVAudioEngine()
+    private let ttsPlayer = AVAudioPlayerNode()
+    private let earconPlayer = AVAudioPlayerNode()
+    private let keepalivePlayer = AVAudioPlayerNode()
+
+    /// 16 kHz mono float — what the VAD runs on and what we ship to STT.
+    private let captureFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    /// 24 kHz mono float — Kokoro's native rate; the mixer resamples to HW out.
+    private let playbackFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false)!
+
+    private var inputConverter: AVAudioConverter?
+
+    // MARK: State
+    private var sessionActive = false
+    private var graphConnected = false
+    private var mode: Mode = .handsfree
+    private var pttCapturing = false
+    private var interrupted = false
+
+    /// Set while TTS audio is queued/playing. The VAD is suppressed so Eve's
+    /// own voice can't trigger an utterance (half-duplex).
+    private var isSpeaking = false
+    private var pendingTTSBuffers = 0
+    /// A "turn" spans all the sentence chunks of one assistant response. The
+    /// queue can briefly drain *between* chunks (network gaps), so a drain only
+    /// ends the turn once the server has signalled it's done (`endTTSTurn`).
+    private var ttsTurnActive = false
+    private var ttsTurnComplete = false
+    /// Bumped on barge-in / stop so completion handlers from abandoned buffers
+    /// don't decrement the new generation's count.
+    private var playbackGeneration = 0
+    private let playbackLock = NSLock()
+
+    /// Serializes utterance finalization (WAV encode + base64) off the realtime
+    /// audio thread.
+    private let finalizeQueue = DispatchQueue(label: "com.barelyworkingcode.relayclient.audio.finalize")
+
+    // MARK: VAD tunables (energy endpointer; ~20 ms frames at 16 kHz)
+    private let frameSamples = 320
+    private let rmsThreshold: Float = 0.012
+    private let startFrames = 3        // ~60 ms over threshold confirms speech
+    private let endSilenceFrames = 40  // ~800 ms under threshold ends the turn
+    private let minUtteranceFrames = 12 // ~240 ms floor (drop shorter misfires)
+    private let maxUtteranceFrames = 1500 // ~30 s hard cap
+    private let preRollFrames = 15     // ~300 ms kept so we don't clip onsets
+    private let levelEmitEveryFrames = 5 // ~100 ms cadence for the orb
+
+    // MARK: VAD running state (touched only on the audio thread)
+    private var frameAccumulator: [Float] = []
+    private var preRoll: [[Float]] = []
+    private var utterance: [Float] = []
+    private var inSpeech = false
+    private var speechRun = 0
+    private var silenceRun = 0
+    private var levelFrameCounter = 0
+
+    // MARK: - Session lifecycle
+
+    func startSession(mode: Mode) {
+        if sessionActive {
+            setMode(mode)
+            return
+        }
+        self.mode = mode
+        do {
+            try configureSession(active: true)
+            connectGraphIfNeeded()
+            try installInputTap()
+            engine.prepare()
+            try engine.start()
+            ttsPlayer.play()
+            earconPlayer.play()
+            startKeepalive()
+            sessionActive = true
+            os_log("Session started (mode=%{public}@)", log: audioLog, type: .info, mode.rawValue)
+            onEvent?("onSessionStarted", ["mode": mode.rawValue])
+            enterListening()
+        } catch {
+            os_log("startSession failed: %{public}@", log: audioLog, type: .error, error.localizedDescription)
+            onEvent?("onError", ["where": "startSession", "message": error.localizedDescription])
+        }
+    }
+
+    func stopSession() {
+        guard sessionActive else { return }
+        sessionActive = false
+        pttCapturing = false
+        engine.inputNode.removeTap(onBus: 0)
+        ttsPlayer.stop()
+        earconPlayer.stop()
+        keepalivePlayer.stop()
+        engine.stop()
+        resetVAD()
+        try? configureSession(active: false)
+        os_log("Session stopped", log: audioLog, type: .info)
+        onEvent?("onSessionStopped", [:])
+    }
+
+    // MARK: - Background keep-alive probe (diagnostic)
+
+    /// Hold the background-audio assertion with a silent loop ONLY — no mic, no
+    /// VAD, no earcons — so a device test can isolate the one open question:
+    /// does a running AVAudioEngine keep the WKWebView's JS + WebSocket alive
+    /// while the phone is locked? Triggered from JS (relayclient://bgspike).
+    func startKeepaliveProbe() {
+        guard !sessionActive else { return }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .spokenAudio, options: [])
+            try session.setActive(true)
+            connectGraphIfNeeded()
+            engine.prepare()
+            try engine.start()
+            startKeepalive()
+            sessionActive = true
+            os_log("Keepalive probe started (silent background hold)", log: audioLog, type: .info)
+            onEvent?("onSessionStarted", ["mode": "keepalive"])
+        } catch {
+            os_log("Keepalive probe failed: %{public}@", log: audioLog, type: .error, error.localizedDescription)
+            onEvent?("onError", ["where": "keepaliveProbe", "message": error.localizedDescription])
+        }
+    }
+
+    func stopKeepaliveProbe() { stopSession() }
+
+    func setMode(_ mode: Mode) {
+        guard self.mode != mode else { return }
+        self.mode = mode
+        pttCapturing = false
+        resetVAD()
+        os_log("Mode -> %{public}@", log: audioLog, type: .info, mode.rawValue)
+        enterListening()
+    }
+
+    // MARK: - Push-to-talk
+
+    func startCapture() {
+        guard sessionActive else { return }
+        stopPlayback() // pressing to talk barges in over any playback
+        resetVAD()
+        pttCapturing = true
+        onEvent?("onSpeechStart", [:])
+    }
+
+    func stopCapture() {
+        guard sessionActive, pttCapturing else { return }
+        pttCapturing = false
+        let samples = utterance
+        utterance = []
+        if samples.count >= minUtteranceFrames * frameSamples {
+            finalizeUtterance(samples)
+        } else {
+            onEvent?("onVADMisfire", [:])
+        }
+    }
+
+    // MARK: - Playback (server TTS chunks)
+
+    /// Decode a server WAV chunk (base64) and queue it for gapless playback.
+    func enqueueTTS(base64: String) {
+        guard sessionActive, let data = Data(base64Encoded: base64) else { return }
+        guard let buffer = pcmBuffer(fromWav: data) else {
+            os_log("enqueueTTS: could not decode WAV chunk", log: audioLog, type: .error)
+            return
+        }
+        playbackLock.lock()
+        let startingTurn = !ttsTurnActive
+        if startingTurn {
+            ttsTurnActive = true
+            ttsTurnComplete = false
+            isSpeaking = true
+        }
+        pendingTTSBuffers += 1
+        let gen = playbackGeneration
+        playbackLock.unlock()
+
+        if startingTurn { onEvent?("onSpeaking", [:]) }
+        ttsPlayer.scheduleBuffer(buffer, at: nil, options: []) { [weak self] in
+            self?.onTTSBufferFinished(gen: gen)
+        }
+        if !ttsPlayer.isPlaying { ttsPlayer.play() }
+    }
+
+    /// Server has streamed the last chunk of this response. If the queue has
+    /// already drained, finish now; otherwise the final buffer's completion
+    /// handler will.
+    func endTTSTurn() {
+        playbackLock.lock()
+        ttsTurnComplete = true
+        let drained = ttsTurnActive && pendingTTSBuffers <= 0
+        playbackLock.unlock()
+        if drained { finishTTSTurn(interrupted: false) }
+    }
+
+    /// Barge-in / cancel: drop everything queued and go back to listening.
+    func stopPlayback() {
+        playbackLock.lock()
+        let wasActive = ttsTurnActive || isSpeaking
+        playbackGeneration += 1
+        pendingTTSBuffers = 0
+        ttsTurnActive = false
+        ttsTurnComplete = false
+        isSpeaking = false
+        playbackLock.unlock()
+
+        ttsPlayer.stop()
+        ttsPlayer.play() // keep node hot for the next turn
+        if wasActive {
+            onEvent?("onPlaybackEnded", ["interrupted": true])
+            enterListening()
+        }
+    }
+
+    private func onTTSBufferFinished(gen: Int) {
+        playbackLock.lock()
+        guard gen == playbackGeneration else { playbackLock.unlock(); return }
+        pendingTTSBuffers -= 1
+        // Only end the turn on a drain if the server has said it's done; an
+        // inter-chunk gap must keep us "speaking" (mic stays muted).
+        let finishing = pendingTTSBuffers <= 0 && ttsTurnComplete
+        playbackLock.unlock()
+        if finishing { finishTTSTurn(interrupted: false) }
+    }
+
+    private func finishTTSTurn(interrupted: Bool) {
+        playbackLock.lock()
+        guard ttsTurnActive else { playbackLock.unlock(); return }
+        ttsTurnActive = false
+        ttsTurnComplete = false
+        pendingTTSBuffers = 0
+        isSpeaking = false
+        playbackLock.unlock()
+
+        onEvent?("onPlaybackEnded", ["interrupted": interrupted])
+        enterListening()
+    }
+
+    // MARK: - Earcons (synthesized; play through the engine so they're audible backgrounded)
+
+    func playEarcon(_ name: String) {
+        guard sessionActive, let buffer = earconBuffer(name) else { return }
+        earconPlayer.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
+        if !earconPlayer.isPlaying { earconPlayer.play() }
+    }
+
+    /// Hands-free "your turn" cue + event. Chimes only in hands-free (in PTT the
+    /// user controls timing, so no chime). Played natively so it still sounds
+    /// when the screen is off — the whole point of the eyes-free flow.
+    private func enterListening() {
+        guard sessionActive, mode == .handsfree, !isSpeaking else { return }
+        playEarcon("listening")
+        onEvent?("onListening", [:])
+    }
+
+    // MARK: - Audio session
+
+    private func configureSession(active: Bool) throws {
+        let session = AVAudioSession.sharedInstance()
+        if active {
+            try session.setCategory(.playAndRecord, mode: .spokenAudio,
+                                    options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker])
+            try session.setActive(true)
+        } else {
+            // Restore the app's idle default so plain WebView media still plays.
+            try session.setCategory(.playback, mode: .spokenAudio, options: [])
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+        }
+    }
+
+    // MARK: - Graph
+
+    /// Attach + connect the playback nodes once. The player→mixer format is
+    /// fixed (`playbackFormat`), independent of the mic route, so this never
+    /// needs rebuilding — only the input tap does (see `installInputTap`).
+    private func connectGraphIfNeeded() {
+        guard !graphConnected else { return }
+        engine.attach(ttsPlayer)
+        engine.attach(earconPlayer)
+        engine.attach(keepalivePlayer)
+        engine.connect(ttsPlayer, to: engine.mainMixerNode, format: playbackFormat)
+        engine.connect(earconPlayer, to: engine.mainMixerNode, format: playbackFormat)
+        engine.connect(keepalivePlayer, to: engine.mainMixerNode, format: playbackFormat)
+        graphConnected = true
+    }
+
+    /// (Re)install the mic tap against the current input hardware format and
+    /// rebuild the downsampling converter. Safe to call after a route change.
+    private func installInputTap() throws {
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        let inputFormat = input.inputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw EveAudioError.noInput
+        }
+        inputConverter = AVAudioConverter(from: inputFormat, to: captureFormat)
+        input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
+            self?.processInput(buffer)
+        }
+    }
+
+    // MARK: - Interruptions & route changes (Phase 3)
+
+    func observeAudioSession() {
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(handleInterruption(_:)),
+                       name: AVAudioSession.interruptionNotification, object: nil)
+        nc.addObserver(self, selector: #selector(handleRouteChange(_:)),
+                       name: AVAudioSession.routeChangeNotification, object: nil)
+        nc.addObserver(self, selector: #selector(handleConfigChange(_:)),
+                       name: .AVAudioEngineConfigurationChange, object: engine)
+    }
+
+    @objc private func handleInterruption(_ note: Notification) {
+        guard sessionActive,
+              let info = note.userInfo,
+              let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        switch type {
+        case .began:
+            interrupted = true
+            stopPlayback()
+            engine.pause()
+            onEvent?("onInterruption", ["state": "began"])
+        case .ended:
+            let opts = AVAudioSession.InterruptionOptions(
+                rawValue: info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+            interrupted = false
+            if opts.contains(.shouldResume) { resumeAfterInterruption() }
+            onEvent?("onInterruption", ["state": "ended", "resumed": opts.contains(.shouldResume)])
+        @unknown default: break
+        }
+    }
+
+    private func resumeAfterInterruption() {
+        do {
+            try configureSession(active: true)
+            engine.prepare()
+            try engine.start()
+            ttsPlayer.play()
+            earconPlayer.play()
+            startKeepalive()
+            enterListening()
+        } catch {
+            onEvent?("onError", ["where": "resume", "message": error.localizedDescription])
+        }
+    }
+
+    @objc private func handleRouteChange(_ note: Notification) {
+        guard sessionActive else { return }
+        // A new output route (e.g. Bluetooth car / earbuds) takes over playback
+        // automatically; we just inform JS. The engine rebuild for any HW-format
+        // change is driven by `handleConfigChange`, the canonical signal.
+        let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
+        onEvent?("onRouteChange", ["reason": Int(reason)])
+    }
+
+    /// The engine's HW format changed (route swap, sample-rate change). The
+    /// running graph must be rebuilt or it will assert. This is the documented
+    /// place to do it.
+    @objc private func handleConfigChange(_ note: Notification) {
+        guard sessionActive, !interrupted else { return }
+        os_log("Engine config changed — rebuilding input", log: audioLog, type: .info)
+        stopPlayback()
+        do {
+            try installInputTap()
+            if !engine.isRunning {
+                engine.prepare()
+                try engine.start()
+            }
+            ttsPlayer.play()
+            earconPlayer.play()
+            startKeepalive()
+            resetVAD()
+        } catch {
+            onEvent?("onError", ["where": "rebuild", "message": error.localizedDescription])
+        }
+    }
+
+    /// A looping near-silent buffer keeps a node actively rendering between
+    /// turns, so iOS doesn't suspend the process during conversational pauses.
+    private func startKeepalive() {
+        keepalivePlayer.stop() // idempotent: avoid stacking loops on resume/rebuild
+        let frames = AVAudioFrameCount(playbackFormat.sampleRate * 0.5)
+        guard let silent = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: frames) else { return }
+        silent.frameLength = frames // zero-filled
+        keepalivePlayer.scheduleBuffer(silent, at: nil, options: .loops, completionHandler: nil)
+        keepalivePlayer.play()
+    }
+
+    // MARK: - Capture / VAD (audio thread)
+
+    private func processInput(_ buffer: AVAudioPCMBuffer) {
+        guard sessionActive else { return }
+        // Half-duplex: never listen while we're speaking or chiming.
+        if isSpeaking || earconPlayer.isPlaying { return }
+        if mode == .handsfree {
+            // listen continuously
+        } else if !pttCapturing {
+            return
+        }
+        guard let frames = downsample(buffer) else { return }
+        frameAccumulator.append(contentsOf: frames)
+        while frameAccumulator.count >= frameSamples {
+            let frame = Array(frameAccumulator.prefix(frameSamples))
+            frameAccumulator.removeFirst(frameSamples)
+            if mode == .ptt {
+                utterance.append(contentsOf: frame)
+                emitLevel(rms(frame))
+            } else {
+                processFrameHandsfree(frame)
+            }
+        }
+    }
+
+    private func processFrameHandsfree(_ frame: [Float]) {
+        let level = rms(frame)
+        emitLevel(level)
+        let isVoiced = level > rmsThreshold
+
+        if !inSpeech {
+            preRoll.append(frame)
+            if preRoll.count > preRollFrames { preRoll.removeFirst() }
+            if isVoiced {
+                speechRun += 1
+                if speechRun >= startFrames {
+                    inSpeech = true
+                    silenceRun = 0
+                    for f in preRoll { utterance.append(contentsOf: f) }
+                    preRoll.removeAll()
+                    onEvent?("onSpeechStart", [:])
+                }
+            } else {
+                speechRun = 0
+            }
+            return
+        }
+
+        utterance.append(contentsOf: frame)
+        if isVoiced {
+            silenceRun = 0
+        } else {
+            silenceRun += 1
+        }
+        let frameCount = utterance.count / frameSamples
+        if silenceRun >= endSilenceFrames || frameCount >= maxUtteranceFrames {
+            let done = utterance
+            let voicedEnough = frameCount - silenceRun >= minUtteranceFrames
+            resetVAD()
+            if voicedEnough {
+                finalizeUtterance(done)
+            } else {
+                onEvent?("onVADMisfire", [:])
+            }
+        }
+    }
+
+    private func finalizeUtterance(_ samples: [Float]) {
+        playEarcon("captured")
+        onEvent?("onSpeechEnd", [:])
+        finalizeQueue.async { [weak self] in
+            guard let self = self else { return }
+            let wav = Self.wav16k(from: samples)
+            self.onEvent?("onUtterance", ["audio": wav.base64EncodedString()])
+        }
+    }
+
+    private func resetVAD() {
+        frameAccumulator.removeAll()
+        preRoll.removeAll()
+        utterance.removeAll()
+        inSpeech = false
+        speechRun = 0
+        silenceRun = 0
+    }
+
+    private func emitLevel(_ level: Float) {
+        levelFrameCounter += 1
+        if levelFrameCounter >= levelEmitEveryFrames {
+            levelFrameCounter = 0
+            // Normalize to a roughly 0..1 range for the orb.
+            let norm = min(1.0, level / 0.2)
+            onEvent?("onLevel", ["rms": Double(norm)])
+        }
+    }
+
+    // MARK: - DSP helpers
+
+    private func rms(_ frame: [Float]) -> Float {
+        var sum: Float = 0
+        for s in frame { sum += s * s }
+        return (sum / Float(frame.count)).squareRoot()
+    }
+
+    /// Convert an arbitrary-rate input buffer to 16 kHz mono float samples.
+    private func downsample(_ buffer: AVAudioPCMBuffer) -> [Float]? {
+        guard let converter = inputConverter else { return nil }
+        let ratio = captureFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+        guard let out = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: capacity) else { return nil }
+        var fed = false
+        var err: NSError?
+        converter.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true
+            status.pointee = .haveData
+            return buffer
+        }
+        if let err = err {
+            os_log("downsample error: %{public}@", log: audioLog, type: .error, err.localizedDescription)
+            return nil
+        }
+        guard let ch = out.floatChannelData else { return nil }
+        return Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
+    }
+
+    /// Build a 16 kHz mono 16-bit PCM WAV from float samples.
+    private static func wav16k(from samples: [Float]) -> Data {
+        let sampleRate = 16000
+        var data = Data(capacity: 44 + samples.count * 2)
+        let byteRate = sampleRate * 2
+        let dataBytes = samples.count * 2
+
+        func append<T: FixedWidthInteger>(_ v: T) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: Array("RIFF".utf8))
+        append(UInt32(36 + dataBytes))
+        data.append(contentsOf: Array("WAVE".utf8))
+        data.append(contentsOf: Array("fmt ".utf8))
+        append(UInt32(16))           // PCM chunk size
+        append(UInt16(1))            // audio format = PCM
+        append(UInt16(1))            // channels
+        append(UInt32(sampleRate))
+        append(UInt32(byteRate))
+        append(UInt16(2))            // block align
+        append(UInt16(16))           // bits per sample
+        data.append(contentsOf: Array("data".utf8))
+        append(UInt32(dataBytes))
+        for s in samples {
+            let clamped = max(-1.0, min(1.0, s))
+            append(Int16(clamped * 32767))
+        }
+        return data
+    }
+
+    /// Decode a server WAV chunk (16-bit PCM, usually 24 kHz mono) into a buffer
+    /// in `playbackFormat`, resampling if the source rate differs.
+    private func pcmBuffer(fromWav data: Data) -> AVAudioPCMBuffer? {
+        guard let wav = Self.parseWav(data) else { return nil }
+        guard let srcFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: Double(wav.sampleRate),
+            channels: AVAudioChannelCount(wav.channels), interleaved: false) else { return nil }
+
+        let srcFrames = wav.pcm.count / (2 * wav.channels)
+        guard srcFrames > 0,
+              let srcBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: AVAudioFrameCount(srcFrames))
+        else { return nil }
+        srcBuffer.frameLength = AVAudioFrameCount(srcFrames)
+
+        wav.pcm.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let ints = raw.bindMemory(to: Int16.self)
+            for ch in 0..<wav.channels {
+                guard let out = srcBuffer.floatChannelData?[ch] else { continue }
+                for f in 0..<srcFrames {
+                    out[f] = Float(Int16(littleEndian: ints[f * wav.channels + ch])) / 32768.0
+                }
+            }
+        }
+
+        if wav.sampleRate == Int(playbackFormat.sampleRate) && wav.channels == 1 {
+            return srcBuffer
+        }
+        guard let converter = AVAudioConverter(from: srcFormat, to: playbackFormat) else { return nil }
+        let ratio = playbackFormat.sampleRate / srcFormat.sampleRate
+        let capacity = AVAudioFrameCount(Double(srcFrames) * ratio) + 16
+        guard let out = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: capacity) else { return nil }
+        var fed = false
+        var err: NSError?
+        converter.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true
+            status.pointee = .haveData
+            return srcBuffer
+        }
+        return err == nil ? out : nil
+    }
+
+    private struct Wav { let sampleRate: Int; let channels: Int; let pcm: Data }
+
+    /// Minimal RIFF/WAVE parser: locates `fmt ` (rate/channels) and `data`
+    /// (PCM payload). Tolerant of extra chunks before `data`.
+    private static func parseWav(_ data: Data) -> Wav? {
+        guard data.count > 44 else { return nil }
+        func u32(_ o: Int) -> Int { Int(data[o]) | Int(data[o+1])<<8 | Int(data[o+2])<<16 | Int(data[o+3])<<24 }
+        func u16(_ o: Int) -> Int { Int(data[o]) | Int(data[o+1])<<8 }
+        guard data[0] == 0x52, data[1] == 0x49, data[2] == 0x46, data[3] == 0x46 else { return nil } // "RIFF"
+
+        var sampleRate = 24000, channels = 1
+        var offset = 12
+        while offset + 8 <= data.count {
+            let id = String(bytes: data[offset..<offset+4], encoding: .ascii) ?? ""
+            let size = u32(offset + 4)
+            let body = offset + 8
+            if id == "fmt " && body + 16 <= data.count {
+                channels = max(1, u16(body + 2))
+                sampleRate = u32(body + 4)
+            } else if id == "data" {
+                let end = min(data.count, body + size)
+                return Wav(sampleRate: sampleRate, channels: channels, pcm: data.subdata(in: body..<end))
+            }
+            offset = body + size + (size & 1) // chunks are word-aligned
+        }
+        return nil
+    }
+
+    /// Synthesize a short earcon tone buffer (24 kHz mono) with a quick fade so
+    /// it never clicks. Distinct tones per state for eyes-free recognition.
+    private func earconBuffer(_ name: String) -> AVAudioPCMBuffer? {
+        let spec: (freq: Double, ms: Double, freq2: Double?)
+        switch name {
+        case "listening": spec = (660, 90, nil)        // soft single blip — mic open
+        case "captured":  spec = (520, 70, nil)        // lower confirm — got your speech
+        case "thinking":  spec = (440, 55, nil)        // subtle tick — working
+        case "error":     spec = (200, 120, 160)       // low two-tone — problem
+        default:          spec = (600, 80, nil)
+        }
+        let rate = playbackFormat.sampleRate
+        let total = AVAudioFrameCount(rate * spec.ms / 1000.0)
+        guard total > 0, let buf = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: total),
+              let ch = buf.floatChannelData?[0] else { return nil }
+        buf.frameLength = total
+        let n = Int(total)
+        let fade = max(1, n / 8)
+        for i in 0..<n {
+            let t = Double(i) / rate
+            let freq = (spec.freq2 != nil && i > n / 2) ? spec.freq2! : spec.freq
+            var amp = 0.22 * sin(2.0 * Double.pi * freq * t)
+            if i < fade { amp *= Double(i) / Double(fade) }
+            if i > n - fade { amp *= Double(n - i) / Double(fade) }
+            ch[i] = Float(amp)
+        }
+        return buf
+    }
+
+    // MARK: - Status
+
+    func getStatus() -> [String: Any] {
+        ["sessionActive": sessionActive, "mode": mode.rawValue, "speaking": isSpeaking]
+    }
+}
+
+enum EveAudioError: LocalizedError {
+    case noInput
+    var errorDescription: String? {
+        switch self {
+        case .noInput: return "No audio input available (mic not ready)."
+        }
+    }
+}

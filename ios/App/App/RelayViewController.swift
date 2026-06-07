@@ -17,6 +17,7 @@ class RelayViewController: CAPBridgeViewController, ASWebAuthenticationPresentat
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(SSLTrustPlugin())
         bridge?.registerPluginInstance(EveVoicePlugin())
+        bridge?.registerPluginInstance(EveAudioBridgePlugin())
         bridge?.registerPluginInstance(SafariAuthPlugin())
 
         // Watch for initial page load to consume any pending deep link
