@@ -22,6 +22,8 @@ public class EveAudioBridgePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "endTTSTurn", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopPlayback", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "playEarcon", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "startThinkingCue", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "stopThinkingCue", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "haptic", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startKeepaliveProbe", returnType: CAPPluginReturnPromise),
@@ -88,6 +90,16 @@ public class EveAudioBridgePlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func playEarcon(_ call: CAPPluginCall) {
         engine.playEarcon(call.getString("name") ?? "listening")
+        call.resolve()
+    }
+
+    @objc func startThinkingCue(_ call: CAPPluginCall) {
+        engine.startThinkingCue()
+        call.resolve()
+    }
+
+    @objc func stopThinkingCue(_ call: CAPPluginCall) {
+        engine.stopThinkingCue()
         call.resolve()
     }
 
