@@ -23,6 +23,8 @@
 		E20001072DC07C7200EB0008 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = E20001062DC07C7200EB0007 /* FluidAudio */; };
 		E40001012DE07C7200ED0002 /* VoiceChatIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = E40001002DE07C7200ED0001 /* VoiceChatIntent.swift */; };
 		E50001012DF07C7200EE0002 /* SafariAuthPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E50001022DF07C7200EE0003 /* SafariAuthPlugin.swift */; };
+		E60001022EA07C7200EF0003 /* EveAudioBridgePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E60001012EA07C7200EF0002 /* EveAudioBridgePlugin.swift */; };
+		E60001042EA07C7200EF0005 /* EveAudioEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = E60001032EA07C7200EF0004 /* EveAudioEngine.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -43,6 +45,8 @@
 		E30001032DD07C7200EC0004 /* EveListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveListener.swift; sourceTree = "<group>"; };
 		E40001002DE07C7200ED0001 /* VoiceChatIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceChatIntent.swift; sourceTree = "<group>"; };
 		E50001022DF07C7200EE0003 /* SafariAuthPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafariAuthPlugin.swift; sourceTree = "<group>"; };
+		E60001012EA07C7200EF0002 /* EveAudioBridgePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveAudioBridgePlugin.swift; sourceTree = "<group>"; };
+		E60001032EA07C7200EF0004 /* EveAudioEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EveAudioEngine.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -97,10 +101,20 @@
 			isa = PBXGroup;
 			children = (
 				E20001042DC07C7200EB0005 /* EveVoice */,
+				E60001002EA07C7200EF0001 /* EveAudioBridge */,
 				E50001032DF07C7200EE0004 /* SafariAuth */,
 				E10001072DB07C7200EA0007 /* SSLTrust */,
 			);
 			path = Plugins;
+			sourceTree = "<group>";
+		};
+		E60001002EA07C7200EF0001 /* EveAudioBridge */ = {
+			isa = PBXGroup;
+			children = (
+				E60001032EA07C7200EF0004 /* EveAudioEngine.swift */,
+				E60001012EA07C7200EF0002 /* EveAudioBridgePlugin.swift */,
+			);
+			path = EveAudioBridge;
 			sourceTree = "<group>";
 		};
 		E50001032DF07C7200EE0004 /* SafariAuth */ = {
@@ -220,6 +234,8 @@
 				E10001092DB07C7200EA0009 /* RelayViewController.swift in Sources */,
 				E40001012DE07C7200ED0002 /* VoiceChatIntent.swift in Sources */,
 				E50001012DF07C7200EE0002 /* SafariAuthPlugin.swift in Sources */,
+				E60001042EA07C7200EF0005 /* EveAudioEngine.swift in Sources */,
+				E60001022EA07C7200EF0003 /* EveAudioBridgePlugin.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
