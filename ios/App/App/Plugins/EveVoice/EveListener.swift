@@ -12,7 +12,7 @@ class EveListener: NSObject {
     private var loadingTask: Task<Void, Error>?
     private let loadLock = NSLock()
 
-    private var asrEngine: (any StreamingAsrEngine)?
+    private var asrEngine: (any StreamingAsrManager)?
 
     // MARK: - Model Management
 
@@ -36,7 +36,9 @@ class EveListener: NSObject {
 
             onEvent?("modelProgress", ["model": "asr", "progress": 0])
             print("[EveListener] Loading ASR model (Parakeet EOU 160ms)...")
-            let engine = StreamingAsrEngineFactory.create(.parakeetEou160ms)
+            // 0.15.x: factory moved onto the variant; protocol renamed
+            // StreamingAsrEngine → StreamingAsrManager (same method surface).
+            let engine = StreamingModelVariant.parakeetEou160ms.createManager()
             try await engine.loadModels()
             self.asrEngine = engine
             onEvent?("modelProgress", ["model": "asr", "progress": 100])

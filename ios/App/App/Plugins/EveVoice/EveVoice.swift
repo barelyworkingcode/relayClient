@@ -1,17 +1,61 @@
 import Foundation
 import FluidAudio
 
-/// Native TTS engine wrapping FluidAudio's KokoroTtsManager.
-/// Handles model downloading and synthesis on-device.
+/// Native TTS engine wrapping FluidAudio's KokoroAneManager — the ANE-resident
+/// 7-stage Kokoro CoreML chain (FluidAudio 0.15.x). Replaces the pre-0.14
+/// single-graph KokoroTtsManager, whose CPU/BNNS execution path segfaults on
+/// iOS 26. Handles model downloading and synthesis on-device.
 /// Audio is returned as base64 WAV data — JS handles playback.
 class EveVoice: NSObject {
     var onEvent: ((String, [String: Any]) -> Void)?
+
+    /// The KokoroAne English model ships only `af_heart.bin` on HuggingFace.
+    /// FluidAudio's voice-pack format is byte-identical to the upstream Kokoro
+    /// `<voice>.safetensors` tensors, so eve hosts the rest of the English voice
+    /// packs at `https://eve.lan/kokoro-voices/<id>.bin`; we fetch a requested
+    /// voice into FluidAudio's cache on first use (see ensureVoicePack). Only
+    /// English voices are listed — the model uses an English G2P frontend.
+    static let defaultVoiceId = "af_heart"
+    static let availableVoices: [(id: String, name: String, lang: String, gender: String)] = [
+        ("af_heart", "Heart", "American English", "F"),
+        ("af_bella", "Bella", "American English", "F"),
+        ("af_nicole", "Nicole", "American English", "F"),
+        ("af_nova", "Nova", "American English", "F"),
+        ("af_sarah", "Sarah", "American English", "F"),
+        ("af_sky", "Sky", "American English", "F"),
+        ("am_adam", "Adam", "American English", "M"),
+        ("am_echo", "Echo", "American English", "M"),
+        ("am_eric", "Eric", "American English", "M"),
+        ("am_michael", "Michael", "American English", "M"),
+        ("bf_lily", "Lily", "British English", "F"),
+        ("bm_daniel", "Daniel", "British English", "M"),
+        ("bm_george", "George", "British English", "M"),
+    ]
+    static let availableVoiceIds: Set<String> = Set(availableVoices.map { $0.id })
+
+    /// `<voice>.bin` is a flat fp32 [510, 256] style tensor = 522,240 bytes.
+    private static let voicePackByteCount = 510 * 256 * MemoryLayout<Float>.size
+    private static let voiceBaseURL = "https://eve.lan/kokoro-voices"
+
+    /// Where FluidAudio's KokoroAne loader looks for `<voice>.bin` (pinned to
+    /// FluidAudio 0.15.1's layout). Pre-placing a file here makes its loader use
+    /// it instead of trying (and failing) to download it from HuggingFace.
+    private static let voiceCacheDir: URL = {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("fluidaudio/Models/kokoro-82m-coreml/ANE", isDirectory: true)
+    }()
+
+    /// URLSession that trusts the eve.lan self-signed cert for voice-pack fetches,
+    /// mirroring SSLTrustPlugin's WKWebView handling. Scoped strictly to eve.lan.
+    private static let eveSession: URLSession = {
+        URLSession(configuration: .ephemeral, delegate: EveTrustDelegate(), delegateQueue: nil)
+    }()
 
     private var modelsLoaded = false
     private var loadingTask: Task<Void, Error>?
     private let loadLock = NSLock()
 
-    private var ttsManager: KokoroTtsManager?
+    private var ttsManager: KokoroAneManager?
 
     // MARK: - Model Management
 
@@ -34,11 +78,26 @@ class EveVoice: NSObject {
             let startTime = CFAbsoluteTimeGetCurrent()
             onEvent?("modelProgress", ["model": "tts", "progress": 0])
 
-            print("[EveVoice] Loading models (5s variant) using default cache directory")
+            print("[EveVoice] Loading Kokoro ANE models (downloads from HF on first use)")
 
-            let manager = KokoroTtsManager(defaultVoice: "af_heart")
-            let models = try await TtsModels.download(variants: [.fiveSecond])
-            try await manager.initialize(models: models)
+            // KokoroAneManager.initialize() downloads (if missing) and loads the
+            // 7-stage ANE model chain + vocab + default voice pack in one call —
+            // no separate TtsModels.download step.
+            //
+            // computeUnits: .default (FluidAudio's empirical per-stage optima —
+            // ANE-resident encoder/vocoder, scheduler-picked prosody/noise/tail).
+            // This is the only config that produces CORRECT audio: the model uses
+            // data-dependent (dynamic) shapes that only compute right on the ANE.
+            // Forcing stages onto GPU/CPU (.cpuAndGpu) avoids the crash but
+            // disables dynamic shapes → garbled output, so it's not viable.
+            // The ANE path intermittently segfaults in libBNNS on iOS 26.5.1
+            // (an upstream FluidAudio/Apple bug); eve's VoiceCrashGuard recovers
+            // to the server backend if that happens.
+            let manager = KokoroAneManager(
+                variant: .english,
+                defaultVoice: "af_heart"
+            )
+            try await manager.initialize()
 
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
             print("[EveVoice] Models loaded in \(String(format: "%.1f", elapsed))s")
@@ -78,44 +137,45 @@ class EveVoice: NSObject {
             throw EveVoiceError.modelsNotLoaded
         }
 
+        // Resolve the voice. af_heart ships with the model; other English voices
+        // are fetched from eve into the model cache on first use. Anything we
+        // can't make available (unknown voice, or a failed fetch) falls back to
+        // af_heart so synthesis still produces audio instead of a 404.
+        var effectiveVoice = EveVoice.availableVoiceIds.contains(voice) ? voice : EveVoice.defaultVoiceId
+        if effectiveVoice != EveVoice.defaultVoiceId {
+            await ensureVoicePack(effectiveVoice)
+            if !EveVoice.voicePackInstalled(effectiveVoice) {
+                print("[EveVoice] Voice '\(effectiveVoice)' unavailable — falling back to \(EveVoice.defaultVoiceId)")
+                effectiveVoice = EveVoice.defaultVoiceId
+            }
+        }
+        if effectiveVoice != voice {
+            print("[EveVoice] Requested voice '\(voice)' → using '\(effectiveVoice)'")
+        }
+
         let synthStart = CFAbsoluteTimeGetCurrent()
 
         let wavData = try await manager.synthesize(
             text: text,
-            voice: voice,
-            voiceSpeed: 1.0,
-            variantPreference: .fiveSecond
+            voice: effectiveVoice,
+            speed: 1.0
         )
 
         // WAV: 44-byte header, 24kHz, 16-bit mono
         let duration = Double(wavData.count - 44) / (24000.0 * 2.0)
+        let synthElapsed = CFAbsoluteTimeGetCurrent() - synthStart
         let base64 = wavData.base64EncodedString()
-        print("[EveVoice] Sending \(base64.count) bytes audio to JS (\(String(format: "%.1f", duration))s)")
+        print("[EveVoice] Synthesized \(String(format: "%.2f", duration))s audio in \(String(format: "%.2f", synthElapsed))s — sending \(base64.count) base64 bytes to JS")
         return (base64: base64, duration: duration)
     }
 
     // MARK: - Voice Management
 
-    /// American English voices only — other languages need G2P models
-    /// that FluidAudio doesn't resolve with custom storage directories.
+    /// English Kokoro voices supported on-device. af_heart ships with the model;
+    /// the rest are fetched from eve on first use (see ensureVoicePack).
     func getVoices() -> [[String: String]] {
-        let voices: [(id: String, name: String)] = [
-            ("af_alloy", "Alloy"), ("af_aoede", "Aoede"), ("af_bella", "Bella"),
-            ("af_heart", "Heart"), ("af_jessica", "Jessica"), ("af_kore", "Kore"),
-            ("af_nicole", "Nicole"), ("af_nova", "Nova"), ("af_river", "River"),
-            ("af_sarah", "Sarah"), ("af_sky", "Sky"),
-            ("am_adam", "Adam"), ("am_echo", "Echo"), ("am_eric", "Eric"),
-            ("am_fenrir", "Fenrir"), ("am_liam", "Liam"), ("am_michael", "Michael"),
-            ("am_onyx", "Onyx"), ("am_puck", "Puck"), ("am_santa", "Santa"),
-        ]
-
-        return voices.map { v in
-            [
-                "id": v.id,
-                "name": v.name,
-                "lang": "American English",
-                "gender": v.id.hasPrefix("af_") ? "F" : "M",
-            ]
+        return EveVoice.availableVoices.map { v in
+            ["id": v.id, "name": v.name, "lang": v.lang, "gender": v.gender]
         }
     }
 
@@ -123,9 +183,45 @@ class EveVoice: NSObject {
         guard let manager = ttsManager else {
             throw EveVoiceError.modelsNotLoaded
         }
-        print("[EveVoice] Preloading voice: \(voiceId)")
-        try await manager.setDefaultVoice(voiceId)
-        print("[EveVoice] Voice '\(voiceId)' ready")
+        var effectiveVoice = EveVoice.availableVoiceIds.contains(voiceId) ? voiceId : EveVoice.defaultVoiceId
+        if effectiveVoice != EveVoice.defaultVoiceId {
+            await ensureVoicePack(effectiveVoice)
+            if !EveVoice.voicePackInstalled(effectiveVoice) { effectiveVoice = EveVoice.defaultVoiceId }
+        }
+        print("[EveVoice] Setting default voice: \(effectiveVoice)")
+        await manager.setDefaultVoice(effectiveVoice)
+        print("[EveVoice] Voice '\(effectiveVoice)' set (pack loads on next synthesis)")
+    }
+
+    // MARK: - Voice pack fetching (eve-hosted)
+
+    /// True if `<voice>.bin` is already in FluidAudio's cache (af_heart ships
+    /// with the model, so it's always considered installed).
+    private static func voicePackInstalled(_ voice: String) -> Bool {
+        if voice == defaultVoiceId { return true }
+        return FileManager.default.fileExists(atPath: voiceCacheDir.appendingPathComponent("\(voice).bin").path)
+    }
+
+    /// Fetch a Kokoro voice pack from eve into FluidAudio's cache dir if it's not
+    /// already there. FluidAudio only hosts af_heart on HuggingFace; eve serves
+    /// the rest in the model's native format. No-op (logs) on failure — the caller
+    /// falls back to af_heart.
+    private func ensureVoicePack(_ voice: String) async {
+        if EveVoice.voicePackInstalled(voice) { return }
+        guard let url = URL(string: "\(EveVoice.voiceBaseURL)/\(voice).bin") else { return }
+        do {
+            let (data, response) = try await EveVoice.eveSession.data(from: url)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            guard status == 200, data.count == EveVoice.voicePackByteCount else {
+                print("[EveVoice] Voice pack fetch '\(voice)' failed (status \(status), \(data.count) bytes)")
+                return
+            }
+            try FileManager.default.createDirectory(at: EveVoice.voiceCacheDir, withIntermediateDirectories: true)
+            try data.write(to: EveVoice.voiceCacheDir.appendingPathComponent("\(voice).bin"), options: .atomic)
+            print("[EveVoice] Installed voice pack '\(voice)' (\(data.count) bytes) from eve")
+        } catch {
+            print("[EveVoice] Voice pack fetch '\(voice)' errored: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Status
@@ -145,5 +241,24 @@ enum EveVoiceError: LocalizedError {
         switch self {
         case .modelsNotLoaded: return "Models not loaded. Call loadModels() first."
         }
+    }
+}
+
+/// Trusts the eve.lan self-signed certificate for native voice-pack fetches,
+/// mirroring SSLTrustPlugin's WKWebView handling. Scoped strictly to eve.lan —
+/// every other host uses default TLS validation.
+private final class EveTrustDelegate: NSObject, URLSessionDelegate {
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard challenge.protectionSpace.host == "eve.lan",
+              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
     }
 }
