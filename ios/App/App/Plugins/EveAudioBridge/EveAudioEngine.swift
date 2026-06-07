@@ -62,6 +62,18 @@ final class EveAudioEngine: NSObject {
     private var playbackGeneration = 0
     private let playbackLock = NSLock()
 
+    /// Wall-clock deadline until which the mic is ignored because an earcon is
+    /// sounding. We can't use `earconPlayer.isPlaying` for this: an
+    /// AVAudioPlayerNode reports `isPlaying` from `play()` until `stop()`,
+    /// independent of whether a buffer is actually audible — and the node is
+    /// started once at session start, so it would suppress the mic forever.
+    private var earconUntil: CFAbsoluteTime = 0
+
+    /// Repeating faint tick while it's the AI's turn but it hasn't spoken yet
+    /// (thinking / tool-calling), so the user gets an eyes-free "something is
+    /// happening" signal. Started/stopped from JS around the request.
+    private var thinkingTimer: DispatchSourceTimer?
+
     /// Serializes utterance finalization (WAV encode + base64) off the realtime
     /// audio thread.
     private let finalizeQueue = DispatchQueue(label: "com.barelyworkingcode.relayclient.audio.finalize")
@@ -84,6 +96,7 @@ final class EveAudioEngine: NSObject {
     private var speechRun = 0
     private var silenceRun = 0
     private var levelFrameCounter = 0
+    private var loggedFirstBuffer = false
 
     // MARK: - Session lifecycle
 
@@ -116,6 +129,7 @@ final class EveAudioEngine: NSObject {
         guard sessionActive else { return }
         sessionActive = false
         pttCapturing = false
+        stopThinkingCue()
         engine.inputNode.removeTap(onBus: 0)
         ttsPlayer.stop()
         earconPlayer.stop()
@@ -268,8 +282,28 @@ final class EveAudioEngine: NSObject {
 
     // MARK: - Earcons (synthesized; play through the engine so they're audible backgrounded)
 
+    // MARK: - Thinking cue
+
+    func startThinkingCue() {
+        stopThinkingCue()
+        guard sessionActive else { return }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 0.5, repeating: 2.4)
+        timer.setEventHandler { [weak self] in self?.playEarcon("thinking") }
+        thinkingTimer = timer
+        timer.resume()
+    }
+
+    func stopThinkingCue() {
+        thinkingTimer?.cancel()
+        thinkingTimer = nil
+    }
+
     func playEarcon(_ name: String) {
         guard sessionActive, let buffer = earconBuffer(name) else { return }
+        // Suppress the mic for the earcon's duration (+ a small tail) so the
+        // chime can't self-trigger the VAD.
+        earconUntil = CFAbsoluteTimeGetCurrent() + Double(buffer.frameLength) / playbackFormat.sampleRate + 0.08
         earconPlayer.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
         if !earconPlayer.isPlaying { earconPlayer.play() }
     }
@@ -323,7 +357,10 @@ final class EveAudioEngine: NSObject {
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw EveAudioError.noInput
         }
+        os_log("Input tap installed: %.0f Hz, %d ch", log: audioLog, type: .info,
+               inputFormat.sampleRate, Int(inputFormat.channelCount))
         inputConverter = AVAudioConverter(from: inputFormat, to: captureFormat)
+        loggedFirstBuffer = false
         input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             self?.processInput(buffer)
         }
@@ -348,6 +385,7 @@ final class EveAudioEngine: NSObject {
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         switch type {
         case .began:
+            os_log("Audio interruption began", log: audioLog, type: .info)
             interrupted = true
             stopPlayback()
             engine.pause()
@@ -355,6 +393,8 @@ final class EveAudioEngine: NSObject {
         case .ended:
             let opts = AVAudioSession.InterruptionOptions(
                 rawValue: info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+            os_log("Audio interruption ended (shouldResume=%d)", log: audioLog, type: .info,
+                   opts.contains(.shouldResume) ? 1 : 0)
             interrupted = false
             if opts.contains(.shouldResume) { resumeAfterInterruption() }
             onEvent?("onInterruption", ["state": "ended", "resumed": opts.contains(.shouldResume)])
@@ -411,10 +451,22 @@ final class EveAudioEngine: NSObject {
     /// turns, so iOS doesn't suspend the process during conversational pauses.
     private func startKeepalive() {
         keepalivePlayer.stop() // idempotent: avoid stacking loops on resume/rebuild
-        let frames = AVAudioFrameCount(playbackFormat.sampleRate * 0.5)
-        guard let silent = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: frames) else { return }
-        silent.frameLength = frames // zero-filled
-        keepalivePlayer.scheduleBuffer(silent, at: nil, options: .loops, completionHandler: nil)
+        let rate = playbackFormat.sampleRate
+        let frames = AVAudioFrameCount(rate * 0.5)
+        guard let buf = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: frames),
+              let ch = buf.floatChannelData?[0] else { return }
+        buf.frameLength = frames
+        // A continuous, near-inaudible tone — NOT pure silence. iOS can suspend a
+        // background-audio app whose output it detects as silent, which is what
+        // "screen-off works for a bit then stops, resumes on wake" looked like. A
+        // low-amplitude 11 kHz sine (~ -64 dBFS) keeps the assertion reliably held.
+        // Exactly 5500 cycles per 0.5 s buffer at 24 kHz, so the loop is seamless.
+        let n = Int(frames)
+        let amp: Float = 0.0006
+        for i in 0..<n {
+            ch[i] = amp * Float(sin(2.0 * Double.pi * 11000.0 * Double(i) / rate))
+        }
+        keepalivePlayer.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
         keepalivePlayer.play()
     }
 
@@ -422,8 +474,14 @@ final class EveAudioEngine: NSObject {
 
     private func processInput(_ buffer: AVAudioPCMBuffer) {
         guard sessionActive else { return }
-        // Half-duplex: never listen while we're speaking or chiming.
-        if isSpeaking || earconPlayer.isPlaying { return }
+        if !loggedFirstBuffer {
+            loggedFirstBuffer = true
+            os_log("First mic buffer: %.0f Hz, %d ch, %d frames", log: audioLog, type: .info,
+                   buffer.format.sampleRate, Int(buffer.format.channelCount), Int(buffer.frameLength))
+        }
+        // Half-duplex: never listen while we're speaking or while an earcon is
+        // sounding (time-boxed — see earconUntil).
+        if isSpeaking || CFAbsoluteTimeGetCurrent() < earconUntil { return }
         if mode == .handsfree {
             // listen continuously
         } else if !pttCapturing {
@@ -486,6 +544,8 @@ final class EveAudioEngine: NSObject {
     }
 
     private func finalizeUtterance(_ samples: [Float]) {
+        os_log("Utterance captured: %d samples (%.2fs)", log: audioLog, type: .info,
+               samples.count, Double(samples.count) / 16000.0)
         playEarcon("captured")
         onEvent?("onSpeechEnd", [:])
         finalizeQueue.async { [weak self] in
@@ -524,6 +584,15 @@ final class EveAudioEngine: NSObject {
 
     /// Convert an arbitrary-rate input buffer to 16 kHz mono float samples.
     private func downsample(_ buffer: AVAudioPCMBuffer) -> [Float]? {
+        // Rebuild the converter if the live buffer's format differs from what we
+        // built for. Switching to AirPods (or any Bluetooth/USB mic) delivers a
+        // different sample rate / channel layout than the built-in mic; a stale
+        // converter then yields silence — the "AirPods records nothing" bug.
+        if inputConverter?.inputFormat != buffer.format {
+            os_log("Input format changed to %.0f Hz, %d ch — rebuilding converter",
+                   log: audioLog, type: .info, buffer.format.sampleRate, Int(buffer.format.channelCount))
+            inputConverter = AVAudioConverter(from: buffer.format, to: captureFormat)
+        }
         guard let converter = inputConverter else { return nil }
         let ratio = captureFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
@@ -645,13 +714,13 @@ final class EveAudioEngine: NSObject {
     /// Synthesize a short earcon tone buffer (24 kHz mono) with a quick fade so
     /// it never clicks. Distinct tones per state for eyes-free recognition.
     private func earconBuffer(_ name: String) -> AVAudioPCMBuffer? {
-        let spec: (freq: Double, ms: Double, freq2: Double?)
+        let spec: (freq: Double, ms: Double, freq2: Double?, gain: Double)
         switch name {
-        case "listening": spec = (660, 90, nil)        // soft single blip — mic open
-        case "captured":  spec = (520, 70, nil)        // lower confirm — got your speech
-        case "thinking":  spec = (440, 55, nil)        // subtle tick — working
-        case "error":     spec = (200, 120, 160)       // low two-tone — problem
-        default:          spec = (600, 80, nil)
+        case "listening": spec = (660, 90, nil, 0.22)    // soft single blip — mic open
+        case "captured":  spec = (520, 70, nil, 0.22)    // lower confirm — got your speech
+        case "thinking":  spec = (480, 55, nil, 0.06)    // faint repeating tick — AI working
+        case "error":     spec = (200, 120, 160, 0.22)   // low two-tone — problem
+        default:          spec = (600, 80, nil, 0.22)
         }
         let rate = playbackFormat.sampleRate
         let total = AVAudioFrameCount(rate * spec.ms / 1000.0)
@@ -663,7 +732,7 @@ final class EveAudioEngine: NSObject {
         for i in 0..<n {
             let t = Double(i) / rate
             let freq = (spec.freq2 != nil && i > n / 2) ? spec.freq2! : spec.freq
-            var amp = 0.22 * sin(2.0 * Double.pi * freq * t)
+            var amp = spec.gain * sin(2.0 * Double.pi * freq * t)
             if i < fade { amp *= Double(i) / Double(fade) }
             if i > n - fade { amp *= Double(n - i) / Double(fade) }
             ch[i] = Float(amp)
