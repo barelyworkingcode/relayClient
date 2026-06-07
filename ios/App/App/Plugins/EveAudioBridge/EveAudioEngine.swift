@@ -83,7 +83,12 @@ final class EveAudioEngine: NSObject {
     private let rmsThreshold: Float = 0.012
     private let startFrames = 3        // ~60 ms over threshold confirms speech
     private let endSilenceFrames = 40  // ~800 ms under threshold ends the turn
-    private let minUtteranceFrames = 12 // ~240 ms floor (drop shorter misfires)
+    private let minUtteranceFrames = 12 // ~240 ms floor for PTT (deliberate hold)
+    // Hands-free needs a higher floor: the VAD will occasionally endpoint on a
+    // cough / footstep / half-second of noise, and Whisper hallucinates a junk
+    // word from it. Drop anything under ~0.5 s of actual speech before it's ever
+    // sent to STT.
+    private let minHandsfreeVoicedFrames = 25 // ~500 ms of voiced speech
     private let maxUtteranceFrames = 1500 // ~30 s hard cap
     private let preRollFrames = 15     // ~300 ms kept so we don't clip onsets
     private let levelEmitEveryFrames = 5 // ~100 ms cadence for the orb
@@ -533,7 +538,7 @@ final class EveAudioEngine: NSObject {
         let frameCount = utterance.count / frameSamples
         if silenceRun >= endSilenceFrames || frameCount >= maxUtteranceFrames {
             let done = utterance
-            let voicedEnough = frameCount - silenceRun >= minUtteranceFrames
+            let voicedEnough = frameCount - silenceRun >= minHandsfreeVoicedFrames
             resetVAD()
             if voicedEnough {
                 finalizeUtterance(done)
