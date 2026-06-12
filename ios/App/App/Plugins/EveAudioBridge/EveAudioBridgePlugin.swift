@@ -25,6 +25,7 @@ public class EveAudioBridgePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "startThinkingCue", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopThinkingCue", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "haptic", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setTuning", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startKeepaliveProbe", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopKeepaliveProbe", returnType: CAPPluginReturnPromise),
@@ -121,6 +122,18 @@ public class EveAudioBridgePlugin: CAPPlugin, CAPBridgedPlugin {
             UIImpactFeedbackGenerator(style: mapped).impactOccurred()
             call.resolve()
         }
+    }
+
+    /// Live VAD/barge-in tuning from JS — eve's frontend ships without an app
+    /// rebuild, so thresholds can be dialed in on-device. Omitted keys keep
+    /// their current values. Resolves with the resulting status for inspection.
+    @objc func setTuning(_ call: CAPPluginCall) {
+        engine.setTuning(
+            bargeInEnabled: call.getBool("bargeInEnabled"),
+            bargeInRmsThreshold: call.getDouble("bargeInRmsThreshold"),
+            bargeInWindowMs: call.getDouble("bargeInWindowMs"),
+            bargeInMinVoicedMs: call.getDouble("bargeInMinVoicedMs"))
+        call.resolve(engine.getStatus())
     }
 
     @objc func getStatus(_ call: CAPPluginCall) {
