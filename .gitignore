@@ -10,3 +10,4 @@ ios/App/Pods/
 # Capacitor generated (can be regenerated)
 ios/App/App/public/
 ios/App/App/capacitor.config.json
+plans/
