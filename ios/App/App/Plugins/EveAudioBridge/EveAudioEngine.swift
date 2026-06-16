@@ -239,10 +239,6 @@ final class EveAudioEngine: NSObject {
             try engine.start()
             startKeepalive()
             sessionActive = true
-            // Issue 2: run the diagnostic watchdog during the silent probe too, so
-            // the onBackgroundDiag heartbeat (and the bgspike overlay) work in the
-            // standard probe flow, not only during a real voice session.
-            startWatchdog()
             os_log("Keepalive probe started (silent background hold)", log: audioLog, type: .info)
             onEvent?("onSessionStarted", ["mode": "keepalive"])
         } catch {
