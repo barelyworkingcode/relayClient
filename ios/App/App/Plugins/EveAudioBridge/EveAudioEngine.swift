@@ -151,6 +151,17 @@ final class EveAudioEngine: NSObject {
     /// without it the process suspends before the interruption even ends.
     private var recoveryTask: UIBackgroundTaskIdentifier = .invalid
 
+    /// Wall-clock of the last watchdog tick. A gap to the current tick far larger
+    /// than the 3 s interval means the process was suspended in between — the
+    /// signal we're hunting (Issue 2).
+    private var lastWatchdogTick: CFAbsoluteTime = 0
+    /// True once the mic tap is installed. The tap is best-effort and decoupled
+    /// from the background-critical playback/keepalive (see installInputTapBestEffort).
+    private var tapInstalled = false
+    /// Set on background/foreground transitions so the watchdog can log app state
+    /// without touching UIApplication off the main thread.
+    private var inBackground = false
+
     // MARK: - Session lifecycle
 
     func startSession(mode: Mode) {
@@ -161,9 +172,8 @@ final class EveAudioEngine: NSObject {
         self.mode = mode
         do {
             try configureSession(active: true)
-            enableVoiceProcessing() // before graph/tap setup — changes I/O formats
+            enableVoiceProcessing() // before graph/start — changes I/O formats
             connectGraphIfNeeded()
-            try installInputTap()
             engine.prepare()
             try engine.start()
             ttsPlayer.play()
@@ -171,8 +181,13 @@ final class EveAudioEngine: NSObject {
             startKeepalive()
             sessionActive = true
             startWatchdog()
-            os_log("Session started (mode=%{public}@, aec=%d)", log: audioLog, type: .info,
-                   mode.rawValue, aecActive ? 1 : 0)
+            // Mic tap is best-effort and installed AFTER the engine is up (Issue 2):
+            // the background-audio assertion only needs playback/keepalive, so a
+            // momentary mic-unavailable (e.g. right at lock) must not abort the
+            // whole session. The watchdog retries the tap if it fails here.
+            installInputTapBestEffort()
+            os_log("Session started (mode=%{public}@, aec=%d, tap=%d)", log: audioLog, type: .info,
+                   mode.rawValue, aecActive ? 1 : 0, tapInstalled ? 1 : 0)
             onEvent?("onSessionStarted", ["mode": mode.rawValue, "aec": aecActive,
                                           "bargeIn": bargeInAvailable])
             enterListening()
@@ -190,6 +205,7 @@ final class EveAudioEngine: NSObject {
         endRecoveryHold()
         stopThinkingCue()
         engine.inputNode.removeTap(onBus: 0)
+        tapInstalled = false
         ttsPlayer.stop()
         earconPlayer.stop()
         keepalivePlayer.stop()
@@ -495,6 +511,13 @@ final class EveAudioEngine: NSObject {
         // never recover. Foregrounding is the user saying "I'm back".
         nc.addObserver(self, selector: #selector(handleDidBecomeActive(_:)),
                        name: UIApplication.didBecomeActiveNotification, object: nil)
+        // Background entry is the critical instant for the audio assertion; the
+        // willEnterForeground pairs the bookkeeping. (didBecomeActive above still
+        // handles dead-engine recovery on wake.)
+        nc.addObserver(self, selector: #selector(handleDidEnterBackground(_:)),
+                       name: UIApplication.didEnterBackgroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(handleWillEnterForeground(_:)),
+                       name: UIApplication.willEnterForegroundNotification, object: nil)
     }
 
     @objc private func handleDidBecomeActive(_ note: Notification) {
@@ -502,6 +525,28 @@ final class EveAudioEngine: NSObject {
         os_log("Foregrounded with dead engine — recovering", log: audioLog, type: .info)
         interrupted = false
         attemptRecovery("foreground")
+    }
+
+    /// Entering background is the critical instant (Issue 2): if audio isn't
+    /// genuinely rendering when the screen locks, iOS suspends within seconds.
+    /// Verify output is flowing under a short background-task bridge; release the
+    /// bridge immediately if healthy (the audio assertion then carries the process).
+    @objc private func handleDidEnterBackground(_ note: Notification) {
+        inBackground = true
+        guard sessionActive else { return }
+        os_log("Entered background — verifying audio is rendering", log: audioLog, type: .info)
+        beginRecoveryHold()
+        let healthy = ensureRendering("background")
+        if healthy { endRecoveryHold() }
+        os_log("Background entry: rendering=%d engine=%d keepalive=%d", log: audioLog,
+               type: healthy ? .info : .error, healthy ? 1 : 0, engine.isRunning ? 1 : 0,
+               keepalivePlayer.isPlaying ? 1 : 0)
+    }
+
+    @objc private func handleWillEnterForeground(_ note: Notification) {
+        inBackground = false
+        guard sessionActive else { return }
+        os_log("Will enter foreground", log: audioLog, type: .info)
     }
 
     @objc private func handleInterruption(_ note: Notification) {
@@ -551,6 +596,8 @@ final class EveAudioEngine: NSObject {
             earconPlayer.play()
             startKeepalive()
             resetVAD()
+            // Re-establish the mic if it was lost during the interruption (Issue 2).
+            if !tapInstalled { installInputTapBestEffort() }
             endRecoveryHold()
             os_log("Audio recovered (%{public}@)", log: audioLog, type: .info, context)
             enterListening()
@@ -583,17 +630,18 @@ final class EveAudioEngine: NSObject {
         aecActive = false
         inputConverter = nil
         interrupted = false
+        tapInstalled = false
         resetVAD()
         do {
             try configureSession(active: true)
             enableVoiceProcessing()
             connectGraphIfNeeded()
-            try installInputTap()
             engine.prepare()
             try engine.start()
             ttsPlayer.play()
             earconPlayer.play()
             startKeepalive()
+            installInputTapBestEffort() // mic is best-effort; keepalive must survive (Issue 2)
             endRecoveryHold()
             os_log("Engine rebuilt after media services reset", log: audioLog, type: .info)
             onEvent?("onPlaybackEnded", ["interrupted": true, "bargeIn": false])
@@ -623,7 +671,6 @@ final class EveAudioEngine: NSObject {
         os_log("Engine config changed — rebuilding input", log: audioLog, type: .info)
         stopPlayback()
         do {
-            try installInputTap()
             if !engine.isRunning {
                 engine.prepare()
                 try engine.start()
@@ -631,6 +678,7 @@ final class EveAudioEngine: NSObject {
             ttsPlayer.play()
             earconPlayer.play()
             startKeepalive()
+            installInputTapBestEffort() // mic rebuild is best-effort (Issue 2)
             resetVAD()
         } catch {
             onEvent?("onError", ["where": "rebuild", "message": error.localizedDescription])
@@ -658,10 +706,37 @@ final class EveAudioEngine: NSObject {
     }
 
     private func watchdogTick() {
-        guard sessionActive, !interrupted, !engine.isRunning else { return }
-        os_log("Watchdog: engine not running — attempting restart", log: audioLog, type: .error)
-        beginRecoveryHold()
-        attemptRecovery("watchdog")
+        guard sessionActive else { return }
+        // Diagnostic heartbeat (Issue 2): stamp each tick with the wall-clock gap
+        // to the previous one. While the process is suspended these ticks stop,
+        // so a gap much larger than the 3 s interval is a recorded suspension —
+        // visible in Console.app under the "AudioBridge" category, and emitted to
+        // JS as onBackgroundDiag for the on-device overlay.
+        let now = CFAbsoluteTimeGetCurrent()
+        let gap = lastWatchdogTick > 0 ? now - lastWatchdogTick : 0
+        lastWatchdogTick = now
+        let rendering = engine.isRunning && keepalivePlayer.isPlaying
+        os_log("Watchdog tick: bg=%d rendering=%d engine=%d keepalive=%d tap=%d gap=%.1fs",
+               log: audioLog, type: (gap > 6 || !rendering) ? .error : .info,
+               inBackground ? 1 : 0, rendering ? 1 : 0, engine.isRunning ? 1 : 0,
+               keepalivePlayer.isPlaying ? 1 : 0, tapInstalled ? 1 : 0, gap)
+        onEvent?("onBackgroundDiag", ["gapMs": Int(gap * 1000), "rendering": rendering,
+                                      "engineRunning": engine.isRunning,
+                                      "keepalive": keepalivePlayer.isPlaying,
+                                      "inBackground": inBackground])
+        guard !interrupted else { return }
+        // Re-arm whenever output isn't actually flowing — the engine may be dead
+        // OR "running" with a stopped keepalive (the case the old check, which
+        // tested only engine.isRunning, missed and which let iOS suspend us).
+        if !rendering {
+            os_log("Watchdog: output not flowing — re-arming", log: audioLog, type: .error)
+            beginRecoveryHold()
+            if ensureRendering("watchdog") { endRecoveryHold() }
+        } else if !tapInstalled {
+            // Output healthy but mic lost; retry the tap so listening resumes
+            // (e.g. after a mic-unavailable window at lock).
+            installInputTapBestEffort()
+        }
     }
 
     /// UIKit background task bridging audio downtime. `recoveryTask` is only
@@ -682,6 +757,57 @@ final class EveAudioEngine: NSObject {
             UIApplication.shared.endBackgroundTask(self.recoveryTask)
             self.recoveryTask = .invalid
             os_log("Recovery hold released", log: audioLog, type: .info)
+        }
+    }
+
+    /// Background survival (Issue 2): the single idempotent guarantee that audio
+    /// is actually *rendering* while a session is live — the engine running AND
+    /// the keepalive node playing. iOS holds the background-audio assertion only
+    /// while real output flows, so an engine that reports isRunning==true but
+    /// whose keepalive node has stopped goes silent and gets suspended. Returns
+    /// true when output is confirmed flowing.
+    @discardableResult
+    private func ensureRendering(_ context: String) -> Bool {
+        guard sessionActive, !interrupted else { return false }
+        if !engine.isRunning {
+            do {
+                try configureSession(active: true)
+                engine.prepare()
+                try engine.start()
+                ttsPlayer.play()
+                earconPlayer.play()
+                os_log("ensureRendering(%{public}@): restarted dead engine", log: audioLog, type: .error, context)
+            } catch {
+                os_log("ensureRendering(%{public}@): engine restart failed: %{public}@",
+                       log: audioLog, type: .error, context, error.localizedDescription)
+                return false
+            }
+        }
+        // The piece the old watchdog missed: confirm the keepalive is actually
+        // playing, not merely that the engine object is "running".
+        if !keepalivePlayer.isPlaying {
+            startKeepalive()
+            os_log("ensureRendering(%{public}@): re-armed silent keepalive", log: audioLog, type: .error, context)
+        }
+        // Mic tap is best-effort and not required for the assertion; retry it
+        // here if it dropped, but its absence must not report unhealthy.
+        if !tapInstalled { installInputTapBestEffort() }
+        return engine.isRunning && keepalivePlayer.isPlaying
+    }
+
+    /// Install the mic tap without letting a momentary mic-unavailable (common at
+    /// the instant the screen locks) tear down playback/keepalive — the
+    /// background assertion only needs output. On failure we stay tap-less and
+    /// the watchdog retries; playback + the silent keepalive keep the process
+    /// alive meanwhile.
+    private func installInputTapBestEffort() {
+        do {
+            try installInputTap()
+            tapInstalled = true
+        } catch {
+            tapInstalled = false
+            os_log("Input tap unavailable (%{public}@) — playback/keepalive continue, watchdog will retry",
+                   log: audioLog, type: .error, error.localizedDescription)
         }
     }
 
