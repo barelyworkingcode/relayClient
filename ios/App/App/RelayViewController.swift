@@ -3,8 +3,10 @@ import Capacitor
 import WebKit
 import AuthenticationServices
 import os.log
+import Network
 
 private let deepLinkLog = OSLog(subsystem: "com.barelyworkingcode.relayclient", category: "DeepLink")
+private let netLog = OSLog(subsystem: "com.barelyworkingcode.relayclient", category: "Network")
 
 class RelayViewController: CAPBridgeViewController, ASWebAuthenticationPresentationContextProviding {
 
@@ -13,6 +15,13 @@ class RelayViewController: CAPBridgeViewController, ASWebAuthenticationPresentat
     }
 
     private var loadObserver: NSKeyValueObservation?
+
+    // Network-change reconnect (Issue 1): an NWPathMonitor watches for the phone
+    // moving between networks; on a real change we dispatch 'eve:networkchange'
+    // into the WebView so ws-client.js probes the socket and reconnects fast.
+    private let pathMonitor = NWPathMonitor()
+    private let pathMonitorQueue = DispatchQueue(label: "com.barelyworkingcode.relayclient.network-monitor")
+    private var lastPathSnapshot: String?
 
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(SSLTrustPlugin())
@@ -26,6 +35,44 @@ class RelayViewController: CAPBridgeViewController, ASWebAuthenticationPresentat
                 self?.consumePendingDeepLink()
             }
         }
+
+        startNetworkMonitor()
+    }
+
+    /// Network-change reconnect (Issue 1): watch for the phone moving between
+    /// networks (Wi-Fi↔cellular, Wi-Fi↔Wi-Fi, drop↔restore). On a real change,
+    /// dispatch a 'eve:networkchange' event into the WebView, where ws-client.js
+    /// probes the socket and reconnects fast instead of waiting out the OS TCP
+    /// timeout on a now-dead connection. The first (initial) path report is
+    /// ignored so it can't race the page's own initial connect.
+    private func startNetworkMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            let iface: String
+            if path.usesInterfaceType(.wifi) { iface = "wifi" }
+            else if path.usesInterfaceType(.cellular) { iface = "cellular" }
+            else if path.usesInterfaceType(.wiredEthernet) { iface = "wired" }
+            else { iface = "other" }
+            let snapshot = "\(path.status)-\(iface)"
+            let isFirst = (self.lastPathSnapshot == nil)
+            let changed = (snapshot != self.lastPathSnapshot)
+            self.lastPathSnapshot = snapshot
+            // Only nudge on a real transition into a usable network, and never
+            // on the very first report (which would race the initial connect).
+            guard changed, !isFirst, path.status == .satisfied else { return }
+            os_log("Network path changed (%{public}@) — nudging WebView reconnect",
+                   log: netLog, type: .info, snapshot)
+            DispatchQueue.main.async { [weak self] in
+                self?.webView?.evaluateJavaScript(
+                    "window.dispatchEvent(new Event('eve:networkchange'));",
+                    completionHandler: nil)
+            }
+        }
+        pathMonitor.start(queue: pathMonitorQueue)
+    }
+
+    deinit {
+        pathMonitor.cancel()
     }
 
     private func consumePendingDeepLink() {
