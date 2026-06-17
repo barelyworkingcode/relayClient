@@ -50,6 +50,13 @@ final class EveAudioEngine: NSObject {
     /// 24 kHz mono float — Kokoro's native rate; the mixer resamples to HW out.
     private let playbackFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false)!
+    /// 48 kHz mono — dedicated to the keepalive so it can carry an ~18 kHz tone
+    /// (above most adult hearing). At the 24 kHz playback rate the keep-awake
+    /// tone had to sit near 11 kHz, an audible whistle with the speaker at the
+    /// ear. iOS's background-audio check is on the rendered (non-silent) samples,
+    /// not acoustics, so an 18 kHz tone still holds the assertion while inaudible.
+    private let keepaliveFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
 
     private var inputConverter: AVAudioConverter?
 
@@ -468,7 +475,7 @@ final class EveAudioEngine: NSObject {
         engine.attach(keepalivePlayer)
         engine.connect(ttsPlayer, to: engine.mainMixerNode, format: playbackFormat)
         engine.connect(earconPlayer, to: engine.mainMixerNode, format: playbackFormat)
-        engine.connect(keepalivePlayer, to: engine.mainMixerNode, format: playbackFormat)
+        engine.connect(keepalivePlayer, to: engine.mainMixerNode, format: keepaliveFormat)
         graphConnected = true
     }
 
@@ -815,20 +822,20 @@ final class EveAudioEngine: NSObject {
     /// turns, so iOS doesn't suspend the process during conversational pauses.
     private func startKeepalive() {
         keepalivePlayer.stop() // idempotent: avoid stacking loops on resume/rebuild
-        let rate = playbackFormat.sampleRate
+        let rate = keepaliveFormat.sampleRate
         let frames = AVAudioFrameCount(rate * 0.5)
-        guard let buf = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: frames),
+        guard let buf = AVAudioPCMBuffer(pcmFormat: keepaliveFormat, frameCapacity: frames),
               let ch = buf.floatChannelData?[0] else { return }
         buf.frameLength = frames
         // A continuous, near-inaudible tone — NOT pure silence. iOS can suspend a
-        // background-audio app whose output it detects as silent, which is what
-        // "screen-off works for a bit then stops, resumes on wake" looked like. A
-        // low-amplitude 11 kHz sine (~ -64 dBFS) keeps the assertion reliably held.
-        // Exactly 5500 cycles per 0.5 s buffer at 24 kHz, so the loop is seamless.
+        // background-audio app whose output it detects as silent. An ~18 kHz sine
+        // sits above most adult hearing (no audible whistle), while the non-silent
+        // samples still hold the assertion. Exactly 9000 cycles per 0.5 s buffer
+        // at 48 kHz, so the loop is seamless.
         let n = Int(frames)
-        let amp: Float = 0.0006
+        let amp: Float = 0.002
         for i in 0..<n {
-            ch[i] = amp * Float(sin(2.0 * Double.pi * 11000.0 * Double(i) / rate))
+            ch[i] = amp * Float(sin(2.0 * Double.pi * 18000.0 * Double(i) / rate))
         }
         keepalivePlayer.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
         keepalivePlayer.play()
