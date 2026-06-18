@@ -38,6 +38,14 @@ final class EveAudioEngine: NSObject {
     private var ttsPlayer = AVAudioPlayerNode()
     private var earconPlayer = AVAudioPlayerNode()
     private var keepalivePlayer = AVAudioPlayerNode()
+    /// The keepalive loop is silent (zeros). A *non-silent* keepalive — even an
+    /// inaudible 18 kHz tone — puts the voice processor into a mode that
+    /// suppresses the earcons, and that mode persists across a brief silence, so
+    /// muting/swapping just for the chime doesn't help; it must be silent
+    /// throughout. `tone` is kept only as a fallback if a screen-locked tail ever
+    /// shows the silent keepalive failing to hold the background assertion.
+    private lazy var keepaliveToneBuf = makeKeepaliveBuffer(silent: false)
+    private lazy var keepaliveSilentBuf = makeKeepaliveBuffer(silent: true)
 
     /// True when Apple's voice-processing unit (echo cancellation) is active on
     /// the engine I/O. Barge-in requires it: without AEC the mic hears Eve's own
@@ -310,11 +318,24 @@ final class EveAudioEngine: NSObject {
         let gen = playbackGeneration
         playbackLock.unlock()
 
-        if startingTurn { onEvent?("onSpeaking", [:]) }
+        if startingTurn {
+            onEvent?("onSpeaking", [:])
+            // Pause the keepalive while Eve speaks — it clips the first word.
+            reconcileKeepalive()
+        }
+        // DIAG (first-word clip): on the first buffer of a turn, a cold ttsPlayer
+        // is the onset that gets clipped; earconActive flags an earcon still
+        // sounding as TTS begins (possible overlap/mask).
+        let ttsWasCold = !ttsPlayer.isPlaying
         ttsPlayer.scheduleBuffer(buffer, at: nil, options: []) { [weak self] in
             self?.onTTSBufferFinished(gen: gen)
         }
         if !ttsPlayer.isPlaying { ttsPlayer.play() }
+        if startingTurn {
+            os_log("TTS turn start: ttsCold=%d engine=%d earconActive=%d frames=%d",
+                   log: audioLog, type: .info, ttsWasCold ? 1 : 0, engine.isRunning ? 1 : 0,
+                   (CFAbsoluteTimeGetCurrent() < earconUntil) ? 1 : 0, Int(buffer.frameLength))
+        }
     }
 
     /// Server has streamed the last chunk of this response. If the queue has
@@ -343,6 +364,7 @@ final class EveAudioEngine: NSObject {
 
         ttsPlayer.stop()
         ttsPlayer.play() // keep node hot for the next turn
+        reconcileKeepalive()  // turn cancelled — resume the gap-filler
         if wasActive {
             onEvent?("onPlaybackEnded", ["interrupted": true, "bargeIn": bargeIn])
             // On voice barge-in the user is mid-sentence: no listening earcon
@@ -371,6 +393,7 @@ final class EveAudioEngine: NSObject {
         isSpeaking = false
         playbackLock.unlock()
 
+        reconcileKeepalive()  // resume the gap-filler now the turn is over
         onEvent?("onPlaybackEnded", ["interrupted": interrupted, "bargeIn": false])
         enterListening()
     }
@@ -395,19 +418,47 @@ final class EveAudioEngine: NSObject {
     }
 
     func playEarcon(_ name: String) {
-        guard sessionActive, let buffer = earconBuffer(name) else { return }
+        guard sessionActive else {
+            os_log("Earcon[%{public}@] skipped: session inactive", log: audioLog, type: .error, name)
+            return
+        }
+        guard let buffer = earconBuffer(name) else {
+            os_log("Earcon[%{public}@] skipped: no buffer", log: audioLog, type: .error, name)
+            return
+        }
+        // DIAG (earcon audibility): a cold earconPlayer (isPlaying==false) means
+        // this short tone is the first thing on an idle node — the case we suspect
+        // the voice-processing output swallows.
+        let wasCold = !earconPlayer.isPlaying
         // Suppress the mic for the earcon's duration (+ a small tail) so the
         // chime can't self-trigger the VAD.
-        earconUntil = CFAbsoluteTimeGetCurrent() + Double(buffer.frameLength) / playbackFormat.sampleRate + 0.08
+        let earconDur = Double(buffer.frameLength) / playbackFormat.sampleRate
+        earconUntil = CFAbsoluteTimeGetCurrent() + earconDur + 0.08
+        // Pause the keepalive for the chime — a concurrent keepalive makes the
+        // voice processor swallow it — then resume it (if still idle) just after.
+        reconcileKeepalive()
         earconPlayer.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
         if !earconPlayer.isPlaying { earconPlayer.play() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + earconDur + 0.12) { [weak self] in
+            self?.reconcileKeepalive()
+        }
+        os_log("Earcon[%{public}@] scheduled: cold=%d engine=%d speaking=%d frames=%d",
+               log: audioLog, type: .info, name, wasCold ? 1 : 0, engine.isRunning ? 1 : 0,
+               isSpeaking ? 1 : 0, Int(buffer.frameLength))
     }
 
     /// Hands-free "your turn" cue + event. Chimes only in hands-free (in PTT the
     /// user controls timing, so no chime). Played natively so it still sounds
     /// when the screen is off — the whole point of the eyes-free flow.
     private func enterListening() {
-        guard sessionActive, mode == .handsfree, !isSpeaking, !bargeInCapturing else { return }
+        guard sessionActive, mode == .handsfree, !isSpeaking, !bargeInCapturing else {
+            // DIAG (missing "ready" chime): show why the listening earcon was
+            // skipped — PTT mode, still speaking, or mid barge-in all suppress it.
+            os_log("enterListening suppressed: session=%d mode=%{public}@ speaking=%d bargeIn=%d",
+                   log: audioLog, type: .info, sessionActive ? 1 : 0, mode.rawValue,
+                   isSpeaking ? 1 : 0, bargeInCapturing ? 1 : 0)
+            return
+        }
         playEarcon("listening")
         onEvent?("onListening", [:])
     }
@@ -722,27 +773,31 @@ final class EveAudioEngine: NSObject {
         let now = CFAbsoluteTimeGetCurrent()
         let gap = lastWatchdogTick > 0 ? now - lastWatchdogTick : 0
         lastWatchdogTick = now
-        let rendering = engine.isRunning && keepalivePlayer.isPlaying
-        os_log("Watchdog tick: bg=%d rendering=%d engine=%d keepalive=%d tap=%d gap=%.1fs",
+        // Output is flowing (holding the assertion) if the engine is up and EITHER
+        // real content is playing OR the idle keepalive is. The keepalive is
+        // deliberately paused while an earcon/TTS plays (it suppresses them), so a
+        // stopped keepalive *during content* is healthy, not a fault.
+        let contentPlaying = isSpeaking || now < earconUntil
+        let rendering = engine.isRunning && (contentPlaying || keepalivePlayer.isPlaying)
+        os_log("Watchdog tick: bg=%d rendering=%d engine=%d keepalive=%d content=%d tap=%d gap=%.1fs",
                log: audioLog, type: (gap > 6 || !rendering) ? .error : .info,
                inBackground ? 1 : 0, rendering ? 1 : 0, engine.isRunning ? 1 : 0,
-               keepalivePlayer.isPlaying ? 1 : 0, tapInstalled ? 1 : 0, gap)
+               keepalivePlayer.isPlaying ? 1 : 0, contentPlaying ? 1 : 0, tapInstalled ? 1 : 0, gap)
         onEvent?("onBackgroundDiag", ["gapMs": Int(gap * 1000), "rendering": rendering,
                                       "engineRunning": engine.isRunning,
                                       "keepalive": keepalivePlayer.isPlaying,
                                       "inBackground": inBackground])
         guard !interrupted else { return }
-        // Re-arm whenever output isn't actually flowing — the engine may be dead
-        // OR "running" with a stopped keepalive (the case the old check, which
-        // tested only engine.isRunning, missed and which let iOS suspend us).
         if !rendering {
+            // Engine dead, or idle with the keepalive somehow stopped — recover.
             os_log("Watchdog: output not flowing — re-arming", log: audioLog, type: .error)
             beginRecoveryHold()
             if ensureRendering("watchdog") { endRecoveryHold() }
-        } else if !tapInstalled {
-            // Output healthy but mic lost; retry the tap so listening resumes
-            // (e.g. after a mic-unavailable window at lock).
-            installInputTapBestEffort()
+        } else {
+            // Healthy: keep the gap-filler in sync (resume it if we've gone idle,
+            // leave it paused during content), and retry the mic if it dropped.
+            reconcileKeepalive()
+            if !tapInstalled { installInputTapBestEffort() }
         }
     }
 
@@ -790,16 +845,15 @@ final class EveAudioEngine: NSObject {
                 return false
             }
         }
-        // The piece the old watchdog missed: confirm the keepalive is actually
-        // playing, not merely that the engine object is "running".
-        if !keepalivePlayer.isPlaying {
-            startKeepalive()
-            os_log("ensureRendering(%{public}@): re-armed silent keepalive", log: audioLog, type: .error, context)
-        }
+        // Keep the gap-filler in sync — resume it if we're idle, but never start
+        // it on top of a playing earcon/TTS (that's what suppressed the chimes).
+        // During content the content itself is the non-silent output.
+        reconcileKeepalive()
         // Mic tap is best-effort and not required for the assertion; retry it
         // here if it dropped, but its absence must not report unhealthy.
         if !tapInstalled { installInputTapBestEffort() }
-        return engine.isRunning && keepalivePlayer.isPlaying
+        let contentPlaying = isSpeaking || CFAbsoluteTimeGetCurrent() < earconUntil
+        return engine.isRunning && (contentPlaying || keepalivePlayer.isPlaying)
     }
 
     /// Install the mic tap without letting a momentary mic-unavailable (common at
@@ -818,27 +872,59 @@ final class EveAudioEngine: NSObject {
         }
     }
 
-    /// A looping near-silent buffer keeps a node actively rendering between
-    /// turns, so iOS doesn't suspend the process during conversational pauses.
+    /// (Re)start the keepalive loop. Picks tone vs. silence from the current
+    /// state so a restart mid-utterance doesn't blast a tone over the chime.
     private func startKeepalive() {
         keepalivePlayer.stop() // idempotent: avoid stacking loops on resume/rebuild
+        // ALWAYS silent. On-device, ANY non-silent keepalive — even one swapped
+        // to silence just for the chime's duration — leaves the voice processor
+        // in a mode that suppresses the earcons; only a keepalive that's silent
+        // throughout lets them through. Holding the background assertion is left
+        // to the live session's own continuous mic+speaker I/O; revisit only if a
+        // screen-locked tail shows a real suspension (gap>6s).
+        guard let buf = keepaliveSilentBuf else { return }
+        keepalivePlayer.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
+        keepalivePlayer.play()
+    }
+
+    /// Build a 0.5 s @ 48 kHz mono loop. `silent` → zeros; otherwise an ~18 kHz
+    /// sine (above adult hearing; exactly 9000 cycles → a seamless loop) whose
+    /// non-silent samples hold the background-audio assertion without a whistle.
+    private func makeKeepaliveBuffer(silent: Bool) -> AVAudioPCMBuffer? {
         let rate = keepaliveFormat.sampleRate
         let frames = AVAudioFrameCount(rate * 0.5)
         guard let buf = AVAudioPCMBuffer(pcmFormat: keepaliveFormat, frameCapacity: frames),
-              let ch = buf.floatChannelData?[0] else { return }
+              let ch = buf.floatChannelData?[0] else { return nil }
         buf.frameLength = frames
-        // A continuous, near-inaudible tone — NOT pure silence. iOS can suspend a
-        // background-audio app whose output it detects as silent. An ~18 kHz sine
-        // sits above most adult hearing (no audible whistle), while the non-silent
-        // samples still hold the assertion. Exactly 9000 cycles per 0.5 s buffer
-        // at 48 kHz, so the loop is seamless.
         let n = Int(frames)
-        let amp: Float = 0.002
-        for i in 0..<n {
-            ch[i] = amp * Float(sin(2.0 * Double.pi * 18000.0 * Double(i) / rate))
+        if silent {
+            for i in 0..<n { ch[i] = 0 }
+        } else {
+            let amp: Float = 0.002
+            for i in 0..<n {
+                ch[i] = amp * Float(sin(2.0 * Double.pi * 18000.0 * Double(i) / rate))
+            }
         }
-        keepalivePlayer.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
-        keepalivePlayer.play()
+        return buf
+    }
+
+    /// Gate the keepalive so it never overlaps real audio. A keepalive rendering
+    /// concurrently with an earcon or TTS makes the voice processor suppress the
+    /// earcon and clip TTS onsets (confirmed on-device), so it runs ONLY when the
+    /// output is otherwise idle: paused the instant content starts, resumed once
+    /// it ends. During content the content itself is the non-silent output that
+    /// holds the background assertion. Idempotent; safe from any thread/path.
+    /// Re-arm the keepalive only if the node actually died (rare: a media-services
+    /// reset), and do it off the render thread — startKeepalive() calls stop(),
+    /// which dispatch_syncs onto the render queue and would trap/lock there. With
+    /// the keepalive silent throughout, there's no per-utterance work to do.
+    private func reconcileKeepalive() {
+        guard sessionActive, !keepalivePlayer.isPlaying, engine.isRunning, !interrupted else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.sessionActive, self.engine.isRunning,
+                  !self.interrupted, !self.keepalivePlayer.isPlaying else { return }
+            self.startKeepalive()
+        }
     }
 
     // MARK: - Capture / VAD (audio thread)
@@ -1129,32 +1215,77 @@ final class EveAudioEngine: NSObject {
         return nil
     }
 
-    /// Synthesize a short earcon tone buffer (24 kHz mono) with a quick fade so
-    /// it never clicks. Distinct tones per state for eyes-free recognition.
+    /// Synthesize a short earcon. Each is a percussive, *broadband* notification
+    /// burst — a pitched cluster of harmonics plus a fast-decaying noise chiff —
+    /// not a pure sine. Apple's voice-processing output (AEC) classifies a steady
+    /// pure tone as noise and suppresses it, so the old sine earcons were
+    /// inaudible during a live session (confirmed on-device: scheduled on a warm
+    /// engine, yet silent even at max volume). Harmonics + an onset transient +
+    /// a percussive envelope read as "content" and pass the processor. Distinct
+    /// pitch contours per state keep them recognizable eyes-free.
     private func earconBuffer(_ name: String) -> AVAudioPCMBuffer? {
-        let spec: (freq: Double, ms: Double, freq2: Double?, gain: Double)
+        // Each note: (freq, startMs, durMs). Multi-note contours give motion the
+        // processor (and the ear) treat as content rather than a held tone.
+        let notes: [(freq: Double, startMs: Double, durMs: Double)]
+        let totalMs: Double
+        let peak: Double
         switch name {
-        case "listening": spec = (660, 90, nil, 0.22)    // soft single blip — mic open
-        case "captured":  spec = (520, 70, nil, 0.22)    // lower confirm — got your speech
-        case "thinking":  spec = (480, 55, nil, 0.06)    // faint repeating tick — AI working
-        case "error":     spec = (200, 120, 160, 0.22)   // low two-tone — problem
-        default:          spec = (600, 80, nil, 0.22)
+        case "listening":  // rising two-note — "your turn"
+            notes = [(620, 0, 70), (930, 55, 75)]; totalMs = 130; peak = 0.6
+        case "captured":   // falling two-note — "got your speech"
+            notes = [(720, 0, 65), (500, 50, 70)]; totalMs = 120; peak = 0.6
+        case "thinking":   // single soft tick — "working" (subtle, repeats)
+            notes = [(520, 0, 70)]; totalMs = 70; peak = 0.32
+        case "error":      // low falling two-note — "problem"
+            notes = [(240, 0, 90), (170, 70, 95)]; totalMs = 165; peak = 0.6
+        default:
+            notes = [(600, 0, 90)]; totalMs = 90; peak = 0.5
         }
+
         let rate = playbackFormat.sampleRate
-        let total = AVAudioFrameCount(rate * spec.ms / 1000.0)
-        guard total > 0, let buf = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: total),
+        let n = Int(rate * totalMs / 1000.0)
+        guard n > 0,
+              let buf = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: AVAudioFrameCount(n)),
               let ch = buf.floatChannelData?[0] else { return nil }
-        buf.frameLength = total
-        let n = Int(total)
-        let fade = max(1, n / 8)
-        for i in 0..<n {
-            let t = Double(i) / rate
-            let freq = (spec.freq2 != nil && i > n / 2) ? spec.freq2! : spec.freq
-            var amp = spec.gain * sin(2.0 * Double.pi * freq * t)
-            if i < fade { amp *= Double(i) / Double(fade) }
-            if i > n - fade { amp *= Double(n - i) / Double(fade) }
-            ch[i] = Float(amp)
+        buf.frameLength = AVAudioFrameCount(n)
+
+        var samples = [Double](repeating: 0, count: n)
+        // Deterministic LCG so the chiff is reproducible (no Foundation RNG dep).
+        var seed: UInt32 = 0x2545_F491
+        func noise() -> Double {
+            seed = seed &* 1_664_525 &+ 1_013_904_223
+            return Double(seed >> 9) / Double(1 << 23) - 1.0  // [-1, 1)
         }
+        let harmonics = [1.0, 0.5, 0.28, 0.16]            // fundamental + 3 partials
+        let harmNorm = harmonics.reduce(0, +)             // keep the summed tone bounded
+        let attack = max(1, Int(rate * 0.004))            // 4 ms — crisp, click-free
+        let tail = max(1, Int(rate * 0.004))
+        for note in notes {
+            let start = Int(rate * note.startMs / 1000.0)
+            let dur = max(1, Int(rate * note.durMs / 1000.0))
+            for j in 0..<dur {
+                let idx = start + j
+                if idx >= n { break }
+                let tl = Double(j) / rate
+                var s = 0.0
+                for (h, amp) in harmonics.enumerated() {
+                    s += amp * sin(2.0 * Double.pi * note.freq * Double(h + 1) * tl)
+                }
+                s /= harmNorm
+                // Broadband onset transient, ~10 ms decay — the part AEC won't gate.
+                s += 0.5 * exp(-Double(j) / (rate * 0.010)) * noise()
+                // Percussive envelope: fast attack, exponential decay, short tail fade.
+                var env = exp(-3.2 * Double(j) / Double(dur))
+                if j < attack { env *= Double(j) / Double(attack) }
+                if j > dur - tail { env *= Double(dur - j) / Double(tail) }
+                samples[idx] += s * env
+            }
+        }
+        // Normalize to a controlled peak so summed notes/harmonics never clip.
+        var maxAbs = 1e-9
+        for v in samples { maxAbs = max(maxAbs, abs(v)) }
+        let scale = peak / maxAbs
+        for i in 0..<n { ch[i] = Float(samples[i] * scale) }
         return buf
     }
 
