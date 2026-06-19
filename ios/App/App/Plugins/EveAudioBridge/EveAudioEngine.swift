@@ -1398,23 +1398,20 @@ final class EveAudioEngine: NSObject {
         let bright: [Double] = [1.0, 0.5, 0.28, 0.16]
         let spec: EarconSpec
         switch name {
-        case "listening":  // ready — soft G-major arpeggio over a low root, rings as a chord, "your turn"
-            spec = EarconSpec(notes: [(196.00, 0, 250, 0.5),     // G3 body underneath
-                                      (392.00, 0, 190, 1.0),     // G4
-                                      (493.88, 70, 175, 0.92),   // B4
-                                      (587.33, 140, 165, 0.85)], // D5
-                              totalMs: 305, peak: 0.5, noise: 0.1,
-                              attackMs: 11, decay: 2.3, harmonics: dark)
+        case "listening":  // your turn — rising root-fifth-octave tick (G3-D4-G4), the open/inviting member of the captured/thinking tick family
+            spec = EarconSpec(notes: [(196.00, 0,   55, 0.8),    // G3 root  (= "got it" pitch)
+                                      (293.66, 55,  55, 0.9),    // D4 fifth (= "thinking" pitch)
+                                      (392.00, 110, 75, 1.0)],   // G4 octave — lands bright = "go ahead"
+                              totalMs: 205, peak: 0.30, noise: 0.12,
+                              attackMs: 5, decay: 4.0, harmonics: dark)
         case "captured":   // soft low tick — minimal "got it" when you stop speaking
             spec = EarconSpec(notes: [(196.00, 0, 60, 1.0)],
                               totalMs: 70, peak: 0.26, noise: 0.15,
                               attackMs: 4, decay: 4.2, harmonics: dark)
-        case "thinking":   // soft octave-doubled pulse (A3+A4) + faint fifth — "working", subtle, repeats
-            spec = EarconSpec(notes: [(220.00, 0, 175, 0.5),     // A3 body
-                                      (440.00, 0, 155, 1.0),     // A4 lead
-                                      (330.00, 30, 130, 0.3)],   // E4 faint shimmer
-                              totalMs: 185, peak: 0.22, noise: 0.12,
-                              attackMs: 14, decay: 3.0, harmonics: dark)
+        case "thinking":   // soft tick a fifth above "captured" (D4 vs G3) — same family as "got it", repeats every 2.4s as "working"
+            spec = EarconSpec(notes: [(293.66, 0, 60, 1.0)],     // D4
+                              totalMs: 70, peak: 0.20, noise: 0.12,
+                              attackMs: 5, decay: 4.2, harmonics: dark)
         case "error":      // low falling two-note — "problem"
             spec = EarconSpec(notes: [(240, 0, 90, 1.0), (170, 70, 95, 1.0)],
                               totalMs: 165, peak: 0.6, noise: 0.5,
