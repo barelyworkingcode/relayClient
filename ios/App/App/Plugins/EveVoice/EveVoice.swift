@@ -1,5 +1,8 @@
 import Foundation
 import FluidAudio
+import os.log
+
+private let voiceLog = OSLog(subsystem: "com.barelyworkingcode.relayclient", category: "EveVoice")
 
 /// Native TTS engine wrapping FluidAudio's KokoroAneManager — the ANE-resident
 /// 7-stage Kokoro CoreML chain (FluidAudio 0.15.x). Replaces the pre-0.14
@@ -35,7 +38,7 @@ class EveVoice: NSObject {
 
     /// `<voice>.bin` is a flat fp32 [510, 256] style tensor = 522,240 bytes.
     private static let voicePackByteCount = 510 * 256 * MemoryLayout<Float>.size
-    private static let voiceBaseURL = "https://eve.lan/kokoro-voices"
+    private static let voiceBaseURL = "https://\(EveServerTrust.host)/kokoro-voices"
 
     /// Where FluidAudio's KokoroAne loader looks for `<voice>.bin` (pinned to
     /// FluidAudio 0.15.1's layout). Pre-placing a file here makes its loader use
@@ -69,7 +72,7 @@ class EveVoice: NSObject {
 
         if let existing = loadingTask {
             loadLock.unlock()
-            print("[EveVoice] loadModels() — awaiting existing task")
+            os_log("loadModels() — awaiting existing task", log: voiceLog, type: .info)
             try await existing.value
             return
         }
@@ -78,7 +81,7 @@ class EveVoice: NSObject {
             let startTime = CFAbsoluteTimeGetCurrent()
             onEvent?("modelProgress", ["model": "tts", "progress": 0])
 
-            print("[EveVoice] Loading Kokoro ANE models (downloads from HF on first use)")
+            os_log("Loading Kokoro ANE models (downloads from HF on first use)", log: voiceLog, type: .info)
 
             // KokoroAneManager.initialize() downloads (if missing) and loads the
             // 7-stage ANE model chain + vocab + default voice pack in one call —
@@ -100,7 +103,7 @@ class EveVoice: NSObject {
             try await manager.initialize()
 
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-            print("[EveVoice] Models loaded in \(String(format: "%.1f", elapsed))s")
+            os_log("Models loaded in %.1fs", log: voiceLog, type: .info, elapsed)
 
             ttsManager = manager
             modelsLoaded = true
@@ -118,7 +121,7 @@ class EveVoice: NSObject {
             loadLock.lock()
             loadingTask = nil
             loadLock.unlock()
-            print("[EveVoice] Model loading FAILED: \(error.localizedDescription)")
+            os_log("Model loading FAILED: %{public}@", log: voiceLog, type: .error, error.localizedDescription)
             onEvent?("modelLoaded", ["model": "tts", "status": "error", "message": error.localizedDescription])
             throw error
         }
@@ -129,7 +132,7 @@ class EveVoice: NSObject {
     /// Synthesize text to WAV audio and return the data + duration.
     /// JS handles playback via AudioContext — no native AVAudioPlayer needed.
     func speak(text: String, voice: String) async throws -> (base64: String, duration: Double) {
-        print("[EveVoice] speak() — \(text.count) chars, voice: \(voice)")
+        os_log("speak() — %ld chars, voice: %{public}@", log: voiceLog, type: .info, text.count, voice)
 
         if !modelsLoaded { try await loadModels() }
 
@@ -145,12 +148,12 @@ class EveVoice: NSObject {
         if effectiveVoice != EveVoice.defaultVoiceId {
             await ensureVoicePack(effectiveVoice)
             if !EveVoice.voicePackInstalled(effectiveVoice) {
-                print("[EveVoice] Voice '\(effectiveVoice)' unavailable — falling back to \(EveVoice.defaultVoiceId)")
+                os_log("Voice '%{public}@' unavailable — falling back to %{public}@", log: voiceLog, type: .error, effectiveVoice, EveVoice.defaultVoiceId)
                 effectiveVoice = EveVoice.defaultVoiceId
             }
         }
         if effectiveVoice != voice {
-            print("[EveVoice] Requested voice '\(voice)' → using '\(effectiveVoice)'")
+            os_log("Requested voice '%{public}@' → using '%{public}@'", log: voiceLog, type: .info, voice, effectiveVoice)
         }
 
         let synthStart = CFAbsoluteTimeGetCurrent()
@@ -165,7 +168,7 @@ class EveVoice: NSObject {
         let duration = Double(wavData.count - 44) / (24000.0 * 2.0)
         let synthElapsed = CFAbsoluteTimeGetCurrent() - synthStart
         let base64 = wavData.base64EncodedString()
-        print("[EveVoice] Synthesized \(String(format: "%.2f", duration))s audio in \(String(format: "%.2f", synthElapsed))s — sending \(base64.count) base64 bytes to JS")
+        os_log("Synthesized %.2fs audio in %.2fs — sending %ld base64 bytes to JS", log: voiceLog, type: .info, duration, synthElapsed, base64.count)
         return (base64: base64, duration: duration)
     }
 
@@ -188,9 +191,9 @@ class EveVoice: NSObject {
             await ensureVoicePack(effectiveVoice)
             if !EveVoice.voicePackInstalled(effectiveVoice) { effectiveVoice = EveVoice.defaultVoiceId }
         }
-        print("[EveVoice] Setting default voice: \(effectiveVoice)")
+        os_log("Setting default voice: %{public}@", log: voiceLog, type: .info, effectiveVoice)
         await manager.setDefaultVoice(effectiveVoice)
-        print("[EveVoice] Voice '\(effectiveVoice)' set (pack loads on next synthesis)")
+        os_log("Voice '%{public}@' set (pack loads on next synthesis)", log: voiceLog, type: .info, effectiveVoice)
     }
 
     // MARK: - Voice pack fetching (eve-hosted)
@@ -213,14 +216,14 @@ class EveVoice: NSObject {
             let (data, response) = try await EveVoice.eveSession.data(from: url)
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             guard status == 200, data.count == EveVoice.voicePackByteCount else {
-                print("[EveVoice] Voice pack fetch '\(voice)' failed (status \(status), \(data.count) bytes)")
+                os_log("Voice pack fetch '%{public}@' failed (status %ld, %ld bytes)", log: voiceLog, type: .error, voice, status, data.count)
                 return
             }
             try FileManager.default.createDirectory(at: EveVoice.voiceCacheDir, withIntermediateDirectories: true)
             try data.write(to: EveVoice.voiceCacheDir.appendingPathComponent("\(voice).bin"), options: .atomic)
-            print("[EveVoice] Installed voice pack '\(voice)' (\(data.count) bytes) from eve")
+            os_log("Installed voice pack '%{public}@' (%ld bytes) from eve", log: voiceLog, type: .info, voice, data.count)
         } catch {
-            print("[EveVoice] Voice pack fetch '\(voice)' errored: \(error.localizedDescription)")
+            os_log("Voice pack fetch '%{public}@' errored: %{public}@", log: voiceLog, type: .error, voice, error.localizedDescription)
         }
     }
 
@@ -245,20 +248,18 @@ enum EveVoiceError: LocalizedError {
 }
 
 /// Trusts the eve.lan self-signed certificate for native voice-pack fetches,
-/// mirroring SSLTrustPlugin's WKWebView handling. Scoped strictly to eve.lan —
-/// every other host uses default TLS validation.
+/// mirroring SSLTrustPlugin's WKWebView handling via the shared EveServerTrust —
+/// scoped strictly to eve.lan; every other host uses default TLS validation.
 private final class EveTrustDelegate: NSObject, URLSessionDelegate {
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard challenge.protectionSpace.host == "eve.lan",
-              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let trust = challenge.protectionSpace.serverTrust else {
+        if let credential = EveServerTrust.credential(for: challenge) {
+            completionHandler(.useCredential, credential)
+        } else {
             completionHandler(.performDefaultHandling, nil)
-            return
         }
-        completionHandler(.useCredential, URLCredential(trust: trust))
     }
 }
