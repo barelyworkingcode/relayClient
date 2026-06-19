@@ -187,22 +187,10 @@ final class EveAudioEngine: NSObject {
         self.mode = mode
         do {
             try configureSession(active: true)
-            let vpJustEnabled = !aecActive
             enableVoiceProcessing() // before graph/start — changes I/O formats
             connectGraphIfNeeded()
             engine.prepare()
             try engine.start()
-            // First-start-after-VP swallow: the voice-processing output unit eats
-            // player-node audio on the *very first* engine start after VP is freshly
-            // enabled, so earcons are silent for the entire first session — then fine
-            // on every session after, because stopSession leaves aecActive/
-            // graphConnected set and the next start skips the re-toggle. Cycle the
-            // engine once here so this live run is that clean "second start".
-            if vpJustEnabled && aecActive {
-                engine.stop()
-                engine.prepare()
-                try engine.start()
-            }
             ttsPlayer.play()
             earconPlayer.play()
             startKeepalive()
@@ -217,7 +205,11 @@ final class EveAudioEngine: NSObject {
                    mode.rawValue, aecActive ? 1 : 0, tapInstalled ? 1 : 0)
             onEvent?("onSessionStarted", ["mode": mode.rawValue, "aec": aecActive,
                                           "bargeIn": bargeInAvailable])
-            enterListening()
+            // Hold the opening cue until the engine is actually running. At cold
+            // start enabling voice processing forces a config-change rebuild that
+            // briefly stops the engine, so a synchronous earcon here would land on
+            // engine=0 and be dropped by playEarcon's guard.
+            enterListeningWhenReady()
         } catch {
             os_log("startSession failed: %{public}@", log: audioLog, type: .error, error.localizedDescription)
             onEvent?("onError", ["where": "startSession", "message": error.localizedDescription])
@@ -434,6 +426,17 @@ final class EveAudioEngine: NSObject {
             os_log("Earcon[%{public}@] skipped: session inactive", log: audioLog, type: .error, name)
             return
         }
+        // Never schedule into a stopped engine. At cold-session start the engine is
+        // briefly stopped while enabling voice processing forces a config-change
+        // rebuild; a buffer queued in that window never renders and leaves a stale
+        // buffer at the head of earconPlayer's queue that wedges the node for the
+        // whole session — the silent first conversation. (TTS escapes because the
+        // rebuild stop()+play()s ttsPlayer, clearing its queue; the earcon node is
+        // only ever play()'d, and stop() on a live node hangs this VPIO engine.)
+        guard engine.isRunning else {
+            os_log("Earcon[%{public}@] skipped: engine not running", log: audioLog, type: .error, name)
+            return
+        }
         guard let buffer = earconBuffer(name) else {
             os_log("Earcon[%{public}@] skipped: no buffer", log: audioLog, type: .error, name)
             return
@@ -449,6 +452,10 @@ final class EveAudioEngine: NSObject {
         // Pause the keepalive for the chime — a concurrent keepalive makes the
         // voice processor swallow it — then resume it (if still idle) just after.
         reconcileKeepalive()
+        // NOTE: never stop()/reset() earconPlayer here — stop() on an actively
+        // playing node in this VPIO engine hangs (froze the app on speech-end).
+        // The cold-first-session silence is handled by the engine-running guard
+        // above, not by resetting the node.
         earconPlayer.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
         if !earconPlayer.isPlaying { earconPlayer.play() }
         DispatchQueue.main.asyncAfter(deadline: .now() + earconDur + 0.12) { [weak self] in
@@ -473,6 +480,23 @@ final class EveAudioEngine: NSObject {
         }
         playEarcon("listening")
         onEvent?("onListening", [:])
+    }
+
+    /// Play the opening "your turn" cue once the engine is actually running. At
+    /// cold-session start the engine is briefly stopped while voice processing
+    /// forces a config-change rebuild (~250 ms); firing the cue before then would
+    /// hit playEarcon's engine-not-running guard and be dropped. Retry on main
+    /// until the engine is up, with a ~2 s ceiling so we never spin forever.
+    private func enterListeningWhenReady(attempt: Int = 0) {
+        guard sessionActive else { return }
+        if engine.isRunning { enterListening(); return }
+        guard attempt < 20 else {
+            os_log("enterListeningWhenReady: engine never came up", log: audioLog, type: .error)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.enterListeningWhenReady(attempt: attempt + 1)
+        }
     }
 
     // MARK: - Audio session
