@@ -48,10 +48,8 @@ final class EveAudioEngine: NSObject {
     /// inaudible 18 kHz tone — puts the voice processor into a mode that
     /// suppresses the earcons, and that mode persists across a brief silence, so
     /// muting/swapping just for the chime doesn't help; it must be silent
-    /// throughout. `tone` is kept only as a fallback if a screen-locked tail ever
-    /// shows the silent keepalive failing to hold the background assertion.
-    private lazy var keepaliveToneBuf = makeKeepaliveBuffer(silent: false)
-    private lazy var keepaliveSilentBuf = makeKeepaliveBuffer(silent: true)
+    /// throughout.
+    private lazy var keepaliveSilentBuf = makeSilentKeepaliveBuffer()
 
     /// Earcon buffers synthesized once at session start and only read afterward.
     /// Earcons are deterministic (fixed specs + seeded noise), and playEarcon can
@@ -72,11 +70,9 @@ final class EveAudioEngine: NSObject {
     /// 24 kHz mono float — Kokoro's native rate; the mixer resamples to HW out.
     private let playbackFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false)!
-    /// 48 kHz mono — dedicated to the keepalive so it can carry an ~18 kHz tone
-    /// (above most adult hearing). At the 24 kHz playback rate the keep-awake
-    /// tone had to sit near 11 kHz, an audible whistle with the speaker at the
-    /// ear. iOS's background-audio check is on the rendered (non-silent) samples,
-    /// not acoustics, so an 18 kHz tone still holds the assertion while inaudible.
+    /// 48 kHz mono — the keepalive's dedicated output format. The rate is a
+    /// holdover from when the keepalive carried an inaudible ~18 kHz tone; the
+    /// loop is silent now, so the rate no longer matters and is left as-is.
     private let keepaliveFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
 
@@ -1017,24 +1013,14 @@ final class EveAudioEngine: NSObject {
         keepalivePlayer.play()
     }
 
-    /// Build a 0.5 s @ 48 kHz mono loop. `silent` → zeros; otherwise an ~18 kHz
-    /// sine (above adult hearing; exactly 9000 cycles → a seamless loop) whose
-    /// non-silent samples hold the background-audio assertion without a whistle.
-    private func makeKeepaliveBuffer(silent: Bool) -> AVAudioPCMBuffer? {
+    /// Build a 0.5 s @ 48 kHz mono loop of silence (zeros) for the keepalive.
+    private func makeSilentKeepaliveBuffer() -> AVAudioPCMBuffer? {
         let rate = keepaliveFormat.sampleRate
         let frames = AVAudioFrameCount(rate * 0.5)
         guard let buf = AVAudioPCMBuffer(pcmFormat: keepaliveFormat, frameCapacity: frames),
               let ch = buf.floatChannelData?[0] else { return nil }
         buf.frameLength = frames
-        let n = Int(frames)
-        if silent {
-            for i in 0..<n { ch[i] = 0 }
-        } else {
-            let amp: Float = 0.002
-            for i in 0..<n {
-                ch[i] = amp * Float(sin(2.0 * Double.pi * 18000.0 * Double(i) / rate))
-            }
-        }
+        for i in 0..<Int(frames) { ch[i] = 0 }
         return buf
     }
 
