@@ -29,6 +29,9 @@ public class EveAudioBridgePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startKeepaliveProbe", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopKeepaliveProbe", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "dumpLogs", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setDiagLogging", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getDiagLogging", returnType: CAPPluginReturnPromise),
     ]
 
     private let engine = EveAudioEngine()
@@ -148,5 +151,22 @@ public class EveAudioBridgePlugin: CAPPlugin, CAPBridgedPlugin {
     @objc func stopKeepaliveProbe(_ call: CAPPluginCall) {
         engine.stopKeepaliveProbe()
         call.resolve()
+    }
+
+    /// Drain the in-app diagnostic ring buffer (see DiagLog) so JS can flush any
+    /// lines that were emitted before it subscribed to onDiagLog — e.g. the
+    /// app-launch → first-session cold-start trace — and forward them to eve.
+    @objc func dumpLogs(_ call: CAPPluginCall) {
+        call.resolve(["lines": DiagLog.shared.dump()])
+    }
+
+    /// Toggle device-log streaming to eve (persisted natively; default off).
+    @objc func setDiagLogging(_ call: CAPPluginCall) {
+        engine.setDiagLogging(call.getBool("enabled") ?? false)
+        call.resolve(["enabled": engine.diagLoggingOn])
+    }
+
+    @objc func getDiagLogging(_ call: CAPPluginCall) {
+        call.resolve(["enabled": engine.diagLoggingOn])
     }
 }
