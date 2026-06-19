@@ -187,10 +187,22 @@ final class EveAudioEngine: NSObject {
         self.mode = mode
         do {
             try configureSession(active: true)
+            let vpJustEnabled = !aecActive
             enableVoiceProcessing() // before graph/start — changes I/O formats
             connectGraphIfNeeded()
             engine.prepare()
             try engine.start()
+            // First-start-after-VP swallow: the voice-processing output unit eats
+            // player-node audio on the *very first* engine start after VP is freshly
+            // enabled, so earcons are silent for the entire first session — then fine
+            // on every session after, because stopSession leaves aecActive/
+            // graphConnected set and the next start skips the re-toggle. Cycle the
+            // engine once here so this live run is that clean "second start".
+            if vpJustEnabled && aecActive {
+                engine.stop()
+                engine.prepare()
+                try engine.start()
+            }
             ttsPlayer.play()
             earconPlayer.play()
             startKeepalive()
@@ -1223,27 +1235,55 @@ final class EveAudioEngine: NSObject {
     /// engine, yet silent even at max volume). Harmonics + an onset transient +
     /// a percussive envelope read as "content" and pass the processor. Distinct
     /// pitch contours per state keep them recognizable eyes-free.
-    private func earconBuffer(_ name: String) -> AVAudioPCMBuffer? {
-        // Each note: (freq, startMs, durMs). Multi-note contours give motion the
-        // processor (and the ear) treat as content rather than a held tone.
-        let notes: [(freq: Double, startMs: Double, durMs: Double)]
+    // Per-earcon voice. `noise` is the onset chiff — the broadband burst the AEC
+    // won't gate; every earcon keeps some so it survives the voice processor.
+    // Pitch motion across `notes` also reads as content rather than a held tone.
+    // `gain` per note lets a quiet sub-octave/chord layer sit under the lead.
+    private struct EarconSpec {
+        let notes: [(freq: Double, startMs: Double, durMs: Double, gain: Double)]
         let totalMs: Double
         let peak: Double
+        let noise: Double        // onset transient amount (0 = pure tone)
+        let attackMs: Double     // tonal attack; longer & cosine-shaped = rounder, less clicky
+        let decay: Double        // exp decay constant over each note's duration
+        let harmonics: [Double]  // partial amplitudes, fundamental first
+    }
+
+    private func earconBuffer(_ name: String) -> AVAudioPCMBuffer? {
+        // dark: fundamental + a gentle octave + a faint 3rd — round and warm, no
+        // upper sizzle. bright: the saw-ish stack kept for the louder utility cues.
+        let dark: [Double] = [1.0, 0.4, 0.08]
+        let bright: [Double] = [1.0, 0.5, 0.28, 0.16]
+        let spec: EarconSpec
         switch name {
-        case "listening":  // rising two-note — "your turn"
-            notes = [(620, 0, 70), (930, 55, 75)]; totalMs = 130; peak = 0.6
-        case "captured":   // falling two-note — "got your speech"
-            notes = [(720, 0, 65), (500, 50, 70)]; totalMs = 120; peak = 0.6
-        case "thinking":   // single soft tick — "working" (subtle, repeats)
-            notes = [(520, 0, 70)]; totalMs = 70; peak = 0.32
+        case "listening":  // ready — soft G-major arpeggio over a low root, rings as a chord, "your turn"
+            spec = EarconSpec(notes: [(196.00, 0, 250, 0.5),     // G3 body underneath
+                                      (392.00, 0, 190, 1.0),     // G4
+                                      (493.88, 70, 175, 0.92),   // B4
+                                      (587.33, 140, 165, 0.85)], // D5
+                              totalMs: 305, peak: 0.5, noise: 0.1,
+                              attackMs: 11, decay: 2.3, harmonics: dark)
+        case "captured":   // soft low tick — minimal "got it" when you stop speaking
+            spec = EarconSpec(notes: [(196.00, 0, 60, 1.0)],
+                              totalMs: 70, peak: 0.26, noise: 0.15,
+                              attackMs: 4, decay: 4.2, harmonics: dark)
+        case "thinking":   // soft octave-doubled pulse (A3+A4) + faint fifth — "working", subtle, repeats
+            spec = EarconSpec(notes: [(220.00, 0, 175, 0.5),     // A3 body
+                                      (440.00, 0, 155, 1.0),     // A4 lead
+                                      (330.00, 30, 130, 0.3)],   // E4 faint shimmer
+                              totalMs: 185, peak: 0.22, noise: 0.12,
+                              attackMs: 14, decay: 3.0, harmonics: dark)
         case "error":      // low falling two-note — "problem"
-            notes = [(240, 0, 90), (170, 70, 95)]; totalMs = 165; peak = 0.6
+            spec = EarconSpec(notes: [(240, 0, 90, 1.0), (170, 70, 95, 1.0)],
+                              totalMs: 165, peak: 0.6, noise: 0.5,
+                              attackMs: 4, decay: 3.2, harmonics: bright)
         default:
-            notes = [(600, 0, 90)]; totalMs = 90; peak = 0.5
+            spec = EarconSpec(notes: [(600, 0, 90, 1.0)], totalMs: 90, peak: 0.5,
+                              noise: 0.5, attackMs: 4, decay: 3.2, harmonics: bright)
         }
 
         let rate = playbackFormat.sampleRate
-        let n = Int(rate * totalMs / 1000.0)
+        let n = Int(rate * spec.totalMs / 1000.0)
         guard n > 0,
               let buf = AVAudioPCMBuffer(pcmFormat: playbackFormat, frameCapacity: AVAudioFrameCount(n)),
               let ch = buf.floatChannelData?[0] else { return nil }
@@ -1256,11 +1296,11 @@ final class EveAudioEngine: NSObject {
             seed = seed &* 1_664_525 &+ 1_013_904_223
             return Double(seed >> 9) / Double(1 << 23) - 1.0  // [-1, 1)
         }
-        let harmonics = [1.0, 0.5, 0.28, 0.16]            // fundamental + 3 partials
+        let harmonics = spec.harmonics
         let harmNorm = harmonics.reduce(0, +)             // keep the summed tone bounded
-        let attack = max(1, Int(rate * 0.004))            // 4 ms — crisp, click-free
-        let tail = max(1, Int(rate * 0.004))
-        for note in notes {
+        let attack = max(1, Int(rate * spec.attackMs / 1000.0))
+        let tail = max(1, Int(rate * 0.006))              // 6 ms soft tail fade
+        for note in spec.notes {
             let start = Int(rate * note.startMs / 1000.0)
             let dur = max(1, Int(rate * note.durMs / 1000.0))
             for j in 0..<dur {
@@ -1273,18 +1313,24 @@ final class EveAudioEngine: NSObject {
                 }
                 s /= harmNorm
                 // Broadband onset transient, ~10 ms decay — the part AEC won't gate.
-                s += 0.5 * exp(-Double(j) / (rate * 0.010)) * noise()
-                // Percussive envelope: fast attack, exponential decay, short tail fade.
-                var env = exp(-3.2 * Double(j) / Double(dur))
-                if j < attack { env *= Double(j) / Double(attack) }
-                if j > dur - tail { env *= Double(dur - j) / Double(tail) }
-                samples[idx] += s * env
+                s += spec.noise * exp(-Double(j) / (rate * 0.010)) * noise()
+                // Envelope: raised-cosine attack/tail (click-free), exponential decay.
+                var env = exp(-spec.decay * Double(j) / Double(dur))
+                if j < attack {
+                    let a = Double(j) / Double(attack)
+                    env *= 0.5 - 0.5 * cos(Double.pi * a)
+                }
+                if j > dur - tail {
+                    let t = Double(dur - j) / Double(tail)
+                    env *= 0.5 - 0.5 * cos(Double.pi * t)
+                }
+                samples[idx] += s * env * note.gain
             }
         }
         // Normalize to a controlled peak so summed notes/harmonics never clip.
         var maxAbs = 1e-9
         for v in samples { maxAbs = max(maxAbs, abs(v)) }
-        let scale = peak / maxAbs
+        let scale = spec.peak / maxAbs
         for i in 0..<n { ch[i] = Float(samples[i] * scale) }
         return buf
     }
