@@ -25,6 +25,7 @@ public class EveAudioBridgePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "startThinkingCue", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopThinkingCue", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "haptic", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setAmbientVolume", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setTuning", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startKeepaliveProbe", returnType: CAPPluginReturnPromise),
@@ -141,6 +142,13 @@ public class EveAudioBridgePlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func getStatus(_ call: CAPPluginCall) {
         call.resolve(engine.getStatus())
+    }
+
+    /// Live "River volume" control from the orb-settings slider (0…1). The
+    /// frontend persists the value and re-applies it on init.
+    @objc func setAmbientVolume(_ call: CAPPluginCall) {
+        engine.setAmbientVolume(Float(call.getDouble("volume") ?? 0.12))
+        call.resolve()
     }
 
     @objc func startKeepaliveProbe(_ call: CAPPluginCall) {
