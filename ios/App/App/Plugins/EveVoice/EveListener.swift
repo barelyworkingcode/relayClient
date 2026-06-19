@@ -1,6 +1,9 @@
 import AVFoundation
 import FluidAudio
 import Foundation
+import os.log
+
+private let sttLog = OSLog(subsystem: "com.barelyworkingcode.relayclient", category: "EveListener")
 
 /// Native STT engine wrapping FluidAudio's StreamingAsrEngine.
 /// Receives audio from JS (captured by JS VAD), transcribes it, and returns text.
@@ -26,7 +29,7 @@ class EveListener: NSObject {
 
         if let existing = loadingTask {
             loadLock.unlock()
-            print("[EveListener] loadModels() — awaiting existing task")
+            os_log("loadModels() — awaiting existing task", log: sttLog, type: .info)
             try await existing.value
             return
         }
@@ -35,7 +38,7 @@ class EveListener: NSObject {
             let startTime = CFAbsoluteTimeGetCurrent()
 
             onEvent?("modelProgress", ["model": "asr", "progress": 0])
-            print("[EveListener] Loading ASR model (Parakeet EOU 160ms)...")
+            os_log("Loading ASR model (Parakeet EOU 160ms)…", log: sttLog, type: .info)
             // 0.15.x: factory moved onto the variant; protocol renamed
             // StreamingAsrEngine → StreamingAsrManager (same method surface).
             let engine = StreamingModelVariant.parakeetEou160ms.createManager()
@@ -45,7 +48,7 @@ class EveListener: NSObject {
             onEvent?("modelLoaded", ["model": "asr", "status": "ready"])
 
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-            print("[EveListener] ASR model loaded in \(String(format: "%.1f", elapsed))s")
+            os_log("ASR model loaded in %.1fs", log: sttLog, type: .info, elapsed)
 
             self.modelsLoaded = true
         }
@@ -59,7 +62,7 @@ class EveListener: NSObject {
             loadLock.lock()
             loadingTask = nil
             loadLock.unlock()
-            print("[EveListener] Model loading FAILED: \(error.localizedDescription)")
+            os_log("Model loading FAILED: %{public}@", log: sttLog, type: .error, error.localizedDescription)
             onEvent?("modelLoaded", ["model": "asr", "status": "error", "message": error.localizedDescription])
             throw error
         }
@@ -99,7 +102,7 @@ class EveListener: NSObject {
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        print("[EveListener] Transcribed \(samples.count) samples in \(String(format: "%.2f", elapsed))s → '\(trimmed)'")
+        os_log("Transcribed %ld samples in %.2fs → '%{private}@'", log: sttLog, type: .info, samples.count, elapsed, trimmed)
 
         return trimmed
     }

@@ -1,5 +1,8 @@
 import Foundation
 import Capacitor
+import os.log
+
+private let voicePluginLog = OSLog(subsystem: "com.barelyworkingcode.relayclient", category: "EveVoice")
 
 @objc(EveVoicePlugin)
 public class EveVoicePlugin: CAPPlugin, CAPBridgedPlugin {
@@ -20,7 +23,7 @@ public class EveVoicePlugin: CAPPlugin, CAPBridgedPlugin {
     private let listener = EveListener()
 
     override public func load() {
-        print("[EveVoice] Plugin registered")
+        os_log("Plugin registered", log: voicePluginLog, type: .info)
 
         implementation.onEvent = { [weak self] name, data in
             guard let self = self else { return }
@@ -128,9 +131,18 @@ public class EveVoicePlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
-        // Decode base64 → Float32 samples (16kHz mono from JS VAD)
-        let samples = audioData.withUnsafeBytes { raw in
-            Array(raw.bindMemory(to: Float.self))
+        // Decode base64 → Float32 samples (16kHz mono from JS VAD). Copy into a
+        // typed buffer instead of bindMemory over the raw Data: Data offers no
+        // 4-byte alignment guarantee (a misaligned Float load is undefined
+        // behavior), and a payload whose length isn't a whole number of Float32s
+        // is malformed rather than something to silently truncate.
+        guard audioData.count % MemoryLayout<Float>.size == 0 else {
+            call.reject("Audio payload is not a whole number of Float32 samples")
+            return
+        }
+        var samples = [Float](repeating: 0, count: audioData.count / MemoryLayout<Float>.size)
+        samples.withUnsafeMutableBytes { dst in
+            _ = audioData.copyBytes(to: dst)
         }
 
         Task {
