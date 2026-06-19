@@ -89,17 +89,28 @@ class RelayViewController: CAPBridgeViewController, ASWebAuthenticationPresentat
     func navigateToPath(_ path: String) {
         os_log("navigateToPath: %{public}@, webView=%{public}@", log: deepLinkLog, type: .info, path, webView != nil ? "present" : "nil")
 
+        // `path` is the host of a relayclient:// deep link (see AppDelegate), a
+        // scheme any app or web page can invoke, and it is interpolated into the
+        // JS string literals below and run via evaluateJavaScript. Restrict it to
+        // characters valid in an app route so a crafted host (e.g. a single quote
+        // or backslash) can't break out of the literal and inject script into the
+        // authenticated eve origin (session cookies, auth token, live WebSocket).
+        let safePath = path.filter { $0.isASCII && ($0.isLetter || $0.isNumber || "_-/.".contains($0)) }
+        if safePath != path {
+            os_log("navigateToPath: stripped unsafe characters from deep-link path", log: deepLinkLog, type: .error)
+        }
+
         let js = """
         (function() {
             // Debug toast
             var t = document.createElement('div');
-            t.textContent = 'Action Button → #/\(path)';
+            t.textContent = 'Action Button → #/\(safePath)';
             t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:#333;color:#0f0;padding:8px 16px;border-radius:8px;z-index:99999;font-size:14px;opacity:0.95;';
             document.body.appendChild(t);
             setTimeout(function() { t.remove(); }, 3000);
 
             // Navigate
-            window.location.hash = '#/\(path)';
+            window.location.hash = '#/\(safePath)';
             return 'ok';
         })();
         """
