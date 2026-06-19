@@ -55,3 +55,8 @@ Set your development team in Signing & Capabilities, then build and run.
 cd ios/App
 xcodebuild -scheme App -destination 'platform=iOS,id=<DEVICE_ID>' build
 ```
+
+## Credits
+
+The ambient river bed (`river-loop.wav`, "Soothing River Flow") is sourced from
+[Pixabay](https://pixabay.com/) under the Pixabay Content License.

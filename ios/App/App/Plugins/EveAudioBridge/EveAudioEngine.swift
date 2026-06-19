@@ -51,6 +51,23 @@ final class EveAudioEngine: NSObject {
     /// throughout.
     private lazy var keepaliveSilentBuf = makeSilentKeepaliveBuffer()
 
+    /// Ambient "river" bed — an always-on soothing loop that doubles as the
+    /// audible keepalive. Unlike the silent keepalive it never pauses; it only
+    /// ducks (gain ramps) under TTS and earcons so speech and the cues stay
+    /// clear. Routed through the VP engine so the mic's echo canceller keeps the
+    /// bed out of capture. If the asset is missing it's simply absent — the
+    /// silent keepalive still holds the assertion.
+    private var ambientPlayer = AVAudioPlayerNode()
+    private lazy var ambientBuf = loadAmbientBuffer()
+    private var ambientRampTimer: DispatchSourceTimer?
+    /// Idle bed gain — user-adjustable from the orb-settings "River volume" slider
+    /// via setAmbientVolume(_:). The duck levels are ratios of it, so lowering the
+    /// slider scales the whole envelope. Resets to default each launch; the
+    /// frontend re-applies the persisted value on init.
+    private var ambientIdleVolume: Float = 0.12
+    private let ambientSpeechRatio: Float = 0.5   // dip under TTS so speech stays intelligible
+    private let ambientEarconRatio: Float = 0.33  // dip further under the quiet tick cues
+
     /// Earcon buffers synthesized once at session start and only read afterward.
     /// Earcons are deterministic (fixed specs + seeded noise), and playEarcon can
     /// run on the audio render thread (via finalizeUtterance), so caching keeps
@@ -234,6 +251,7 @@ final class EveAudioEngine: NSObject {
             earconPlayer.play()
             startKeepalive()
             sessionActive = true
+            startAmbient() // always-on river bed (after sessionActive so its guard passes)
             startWatchdog()
             // Mic tap is best-effort and installed AFTER the engine is up (Issue 2):
             // the background-audio assertion only needs playback/keepalive, so a
@@ -266,6 +284,8 @@ final class EveAudioEngine: NSObject {
         ttsPlayer.stop()
         earconPlayer.stop()
         keepalivePlayer.stop()
+        ambientRampTimer?.cancel(); ambientRampTimer = nil
+        ambientPlayer.stop()
         engine.stop()
         resetVAD()
         do {
@@ -369,6 +389,7 @@ final class EveAudioEngine: NSObject {
             onEvent?("onSpeaking", [:])
             // Pause the keepalive while Eve speaks — it clips the first word.
             reconcileKeepalive()
+            refreshAmbientLevel() // duck the river under speech
         }
         // DIAG (first-word clip): on the first buffer of a turn, a cold ttsPlayer
         // is the onset that gets clipped; earconActive flags an earcon still
@@ -410,6 +431,7 @@ final class EveAudioEngine: NSObject {
         ttsPlayer.stop()
         ttsPlayer.play() // keep node hot for the next turn
         reconcileKeepalive()  // turn cancelled — resume the gap-filler
+        refreshAmbientLevel() // river back toward idle
         if wasActive {
             onEvent?("onPlaybackEnded", ["interrupted": true, "bargeIn": bargeIn])
             // On voice barge-in the user is mid-sentence: no listening earcon
@@ -439,6 +461,7 @@ final class EveAudioEngine: NSObject {
         playbackLock.unlock()
 
         reconcileKeepalive()  // resume the gap-filler now the turn is over
+        refreshAmbientLevel() // river back toward idle
         onEvent?("onPlaybackEnded", ["interrupted": interrupted, "bargeIn": false])
         enterListening()
     }
@@ -493,6 +516,7 @@ final class EveAudioEngine: NSObject {
         // Pause the keepalive for the chime — a concurrent keepalive makes the
         // voice processor swallow it — then resume it (if still idle) just after.
         reconcileKeepalive()
+        refreshAmbientLevel() // duck the river under the (quiet) cue
         // NOTE: never stop()/reset() earconPlayer here — stop() on an actively
         // playing node in this VPIO engine hangs (froze the app on speech-end).
         // The cold-first-session silence is handled by the engine-running guard
@@ -501,6 +525,7 @@ final class EveAudioEngine: NSObject {
         if !earconPlayer.isPlaying { earconPlayer.play() }
         DispatchQueue.main.asyncAfter(deadline: .now() + earconDur + 0.12) { [weak self] in
             self?.reconcileKeepalive()
+            self?.refreshAmbientLevel() // restore the river once the cue has passed
         }
         diag("Earcon[\(name)] scheduled: cold=\(wasCold ? 1 : 0) engine=\(engine.isRunning ? 1 : 0) speaking=\(isSpeaking ? 1 : 0) frames=\(buffer.frameLength)")
     }
@@ -608,6 +633,10 @@ final class EveAudioEngine: NSObject {
         engine.connect(ttsPlayer, to: engine.mainMixerNode, format: playbackFormat)
         engine.connect(earconPlayer, to: engine.mainMixerNode, format: playbackFormat)
         engine.connect(keepalivePlayer, to: engine.mainMixerNode, format: keepaliveFormat)
+        if let ambient = ambientBuf {
+            engine.attach(ambientPlayer)
+            engine.connect(ambientPlayer, to: engine.mainMixerNode, format: ambient.format)
+        }
         graphConnected = true
     }
 
@@ -773,6 +802,7 @@ final class EveAudioEngine: NSObject {
             ttsPlayer.play()
             earconPlayer.play()
             startKeepalive()
+            startAmbient()
             resetVAD()
             // Re-establish the mic if it was lost during the interruption (Issue 2).
             if !tapInstalled { installInputTapBestEffort() }
@@ -804,6 +834,7 @@ final class EveAudioEngine: NSObject {
         ttsPlayer = AVAudioPlayerNode()
         earconPlayer = AVAudioPlayerNode()
         keepalivePlayer = AVAudioPlayerNode()
+        ambientPlayer = AVAudioPlayerNode()
         graphConnected = false
         aecActive = false
         inputConverter = nil
@@ -819,6 +850,7 @@ final class EveAudioEngine: NSObject {
             ttsPlayer.play()
             earconPlayer.play()
             startKeepalive()
+            startAmbient()
             installInputTapBestEffort() // mic is best-effort; keepalive must survive (Issue 2)
             endRecoveryHold()
             os_log("Engine rebuilt after media services reset", log: audioLog, type: .info)
@@ -856,6 +888,7 @@ final class EveAudioEngine: NSObject {
             ttsPlayer.play()
             rebuildEarconNode() // fresh node — the stale one renders silent post-rebuild
             startKeepalive()
+            startAmbient()
             installInputTapBestEffort() // mic rebuild is best-effort (Issue 2)
             resetVAD()
         } catch {
@@ -898,7 +931,7 @@ final class EveAudioEngine: NSObject {
         // deliberately paused while an earcon/TTS plays (it suppresses them), so a
         // stopped keepalive *during content* is healthy, not a fault.
         let contentPlaying = isSpeaking || now < earconUntil
-        let rendering = engine.isRunning && (contentPlaying || keepalivePlayer.isPlaying)
+        let rendering = engine.isRunning && (contentPlaying || keepalivePlayer.isPlaying || ambientPlayer.isPlaying)
         diag("Watchdog tick: bg=\(inBackground ? 1 : 0) rendering=\(rendering ? 1 : 0) engine=\(engine.isRunning ? 1 : 0) keepalive=\(keepalivePlayer.isPlaying ? 1 : 0) content=\(contentPlaying ? 1 : 0) tap=\(tapInstalled ? 1 : 0) gap=\(String(format: "%.1f", gap))s",
              type: (gap > 6 || !rendering) ? .error : .info)
         onEvent?("onBackgroundDiag", ["gapMs": Int(gap * 1000), "rendering": rendering,
@@ -963,6 +996,7 @@ final class EveAudioEngine: NSObject {
                 try engine.start()
                 ttsPlayer.play()
                 earconPlayer.play()
+                startAmbient()
                 os_log("ensureRendering(%{public}@): restarted dead engine", log: audioLog, type: .error, context)
             } catch {
                 os_log("ensureRendering(%{public}@): engine restart failed: %{public}@",
@@ -978,7 +1012,7 @@ final class EveAudioEngine: NSObject {
         // here if it dropped, but its absence must not report unhealthy.
         if !tapInstalled { installInputTapBestEffort() }
         let contentPlaying = isSpeaking || CFAbsoluteTimeGetCurrent() < earconUntil
-        return engine.isRunning && (contentPlaying || keepalivePlayer.isPlaying)
+        return engine.isRunning && (contentPlaying || keepalivePlayer.isPlaying || ambientPlayer.isPlaying)
     }
 
     /// Install the mic tap without letting a momentary mic-unavailable (common at
@@ -1040,6 +1074,79 @@ final class EveAudioEngine: NSObject {
             guard let self, self.sessionActive, self.engine.isRunning,
                   !self.interrupted, !self.keepalivePlayer.isPlaying else { return }
             self.startKeepalive()
+        }
+    }
+
+    // MARK: - Ambient river bed
+
+    /// Decode the bundled river loop once into a PCM buffer. nil (asset missing /
+    /// unreadable) disables the bed cleanly. The buffer is read at the file's own
+    /// format; the mixer resamples it like the keepalive's.
+    private func loadAmbientBuffer() -> AVAudioPCMBuffer? {
+        guard let url = Bundle.main.url(forResource: "river-loop", withExtension: "wav"),
+              let file = try? AVAudioFile(forReading: url),
+              file.length > 0,
+              let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                         frameCapacity: AVAudioFrameCount(file.length)) else { return nil }
+        do { try file.read(into: buf) } catch { return nil }
+        return buf
+    }
+
+    /// (Re)start the always-on river loop at idle volume. Modelled on the
+    /// keepalive (reused node, stop()+schedule+play) — NOT the earcon: the bed is
+    /// continuously stop()'d/play()'d, so it doesn't hit the play()-only stale-node
+    /// trap, and losing the first ~0.6 s to AEC warmup is inaudible on a loop.
+    private func startAmbient() {
+        guard sessionActive, let buf = ambientBuf else { return }
+        ambientPlayer.stop() // idempotent: avoid stacking loops on resume/rebuild
+        ambientPlayer.volume = ambientIdleVolume
+        ambientPlayer.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
+        ambientPlayer.play()
+        refreshAmbientLevel() // settle to the current state's level (idle/speech/earcon)
+    }
+
+    /// Pick the bed's target gain from the current state and ramp to it. Called at
+    /// the same transitions as reconcileKeepalive() — earcon wins over TTS wins
+    /// over idle.
+    private func refreshAmbientLevel() {
+        guard ambientBuf != nil else { return }
+        let idle = ambientIdleVolume
+        let target: Float = (CFAbsoluteTimeGetCurrent() < earconUntil) ? idle * ambientEarconRatio
+                          : isSpeaking ? idle * ambientSpeechRatio
+                          : idle
+        rampAmbient(to: target)
+    }
+
+    /// Live "River volume" control (orb-settings slider). Sets the idle bed gain;
+    /// the duck levels track it. Clamped to [0, 1]; applied immediately if the bed
+    /// is playing, and used as the start level by the next startAmbient().
+    func setAmbientVolume(_ volume: Float) {
+        ambientIdleVolume = max(0, min(1, volume))
+        refreshAmbientLevel()
+    }
+
+    /// Ramp ambientPlayer.volume to `target` over ~280 ms so duck/restore doesn't
+    /// step-click. Cancels any in-flight ramp so overlapping transitions settle on
+    /// the latest target. Volume is touched only on main.
+    private func rampAmbient(to target: Float) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.ambientBuf != nil else { return }
+            self.ambientRampTimer?.cancel()
+            let start = self.ambientPlayer.volume
+            if abs(start - target) < 0.005 { self.ambientPlayer.volume = target; return }
+            let steps = 14, interval = 0.02
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + interval, repeating: interval)
+            var step = 0
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                step += 1
+                let t = Float(step) / Float(steps)
+                self.ambientPlayer.volume = start + (target - start) * min(t, 1)
+                if step >= steps { timer.cancel(); self.ambientRampTimer = nil }
+            }
+            self.ambientRampTimer = timer
+            timer.resume()
         }
     }
 
