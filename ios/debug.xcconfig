@@ -1,1 +1,4 @@
 CAPACITOR_DEBUG = true
+
+// Per-machine settings such as DEVELOPMENT_TEAM. Untracked; optional.
+#include? "local.xcconfig"
